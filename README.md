@@ -112,7 +112,12 @@ to help you.
 Known Issues
 ----------------
 
-- **⚠️ Performance Issues (5 FPS)**: The game currently boots and runs, but it is rendering at around 5 frames per second. We are actively profiling and improving this performance by translating and optimizing shaders, resolving EGL overhead, and fixing various rendering bottlenecks. This is a work in progress!
+- **✅ Performance**: significantly improved since earlier builds. The game now runs at a steady ~15-20 FPS in most areas (previously as low as 5 FPS). A few newly-explored/detail-heavy areas may still dip lower; performance work is ongoing.
+- **⚠️ Missing backgrounds on some in-game pop-ups**: text shown *during actual gameplay* — picking up an item, saving your game mid-play, the loading-screen tip when moving between areas — can appear without its usual dark backdrop (the text itself is still readable). The same kind of pop-up shown from the pause menu is not affected. Under investigation.
+- **⚠️ Minimap**: currently only shows your position and nearby markers as colored dots — the terrain map image itself, along with the character/door icons, doesn't render yet.
+- **⚠️ Save pop-up (pause menu)**: the header text of the save-confirmation pop-up can occasionally render transparent (its background is fine, just that one line of text).
+
+These are actively being worked on — see `port_progress.md` in this repository for the full technical diagnosis log if you're curious or want to help.
 
 
 Build Instructions (For Developers)
