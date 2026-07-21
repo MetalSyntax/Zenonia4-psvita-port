@@ -30,7 +30,7 @@ else()
 endif()
 
 ## Oculta la cruceta nativa + botones de accion (zenonia_install_hide_dpad_hook()
-## en loader/dynlib.c) hookeando GVUIPlayerController::CallBack2 -- confirmado
+## en loader/dynlib.c loader/sprite_decode.c) hookeando GVUIPlayerController::CallBack2 -- confirmado
 ## en consola real que, a diferencia de Zenonia 3, este objeto se crea de forma
 ## perezosa (singleton) recien la primera vez que se llama a CallBack2, no en
 ## su propio constructor (ver port_progress.md Fase 15). Si el simbolo no se
@@ -42,7 +42,7 @@ endif()
 
 ## Subir el framebuffer RGB565 del motor directo a una textura
 ## GL_UNSIGNED_SHORT_5_6_5 sin convertir a RGBA8888 en CPU (salta por completo
-## convert_rgb565_to_rgba8888(), ver loader/dynlib.c). Promovido a DEFAULT ON
+## convert_rgb565_to_rgba8888(), ver loader/dynlib.c loader/sprite_decode.c). Promovido a DEFAULT ON
 ## en 2026-07-17 (ver port_progress.md Fase 25/26): probado en consola real,
 ## subio el framerate de ~7-8 FPS (NEON) a 11-14 FPS estable, sin ningun error
 ## de color -- el riesgo conocido del port de Zenonia 2 (mismo motor, mismo
@@ -83,7 +83,7 @@ if (INSTRUMENT_HOTPATH_CALLS)
 endif()
 
 ## optimization_ideas.md #4: redirige los imports "memcpy"/"memset" del .so
-## (tabla default_dynlib en loader/dynlib.c) a neon_mem.c (loop NEON manual de
+## (tabla default_dynlib en loader/dynlib.c loader/sprite_decode.c) a neon_mem.c (loop NEON manual de
 ## 64/16 bytes) en vez de la libc estandar de vitasdk. TODAVIA SIN CONFIRMAR
 ## en consola real -- default OFF, ver build.sh --neon-libc-test para un VPK
 ## separado (mismo criterio de medicion que RGB565_DIRECT_UPLOAD antes de
@@ -111,7 +111,7 @@ endif()
 ## completo cada frame via glTexSubImage2D (solo tiene sentido junto con
 ## RGB565_DIRECT_UPLOAD -- el camino NEON-fallback convierte a RGBA8888 antes,
 ## formato distinto, sin tocar por ahora), compara fila por fila contra una
-## copia cacheada del frame anterior (loader/dynlib.c) y sube solo el rango de
+## copia cacheada del frame anterior (loader/dynlib.c loader/sprite_decode.c) y sube solo el rango de
 ## filas [primera,ultima] que realmente cambiaron. Sin confirmar todavia
 ## cuanto del framebuffer cambia por frame en combate real -- si la respuesta
 ## es "casi todo" (motor 2D con fondo+sprites en movimiento constante), esto
@@ -141,6 +141,104 @@ if (INSTRUMENT_CGSGRAPHICS_CALLS)
   add_definitions(-DZENONIA_INSTRUMENT_CGSGRAPHICS=1)
 endif()
 
+## Fase 41 (port_progress.md), "Lo que NO se ha hecho" #3: reimplementacion
+## REAL (no solo conteo) de CGsGraphics::FastClearNonClipping, confirmada
+## fiel contra su pseudo-C real en out_ghidra.c (ver dynlib.c
+## zenonia_install_fastclear_optimize) -- colapsa el loop de memset por fila
+## en un solo memset cuando el rectangulo es de ancho completo (filas
+## contiguas), y usa neon_memset en el resto de los casos. De las 13
+## primitivas contadas por INSTRUMENT_CGSGRAPHICS_CALLS, es la UNICA con una
+## reimplementacion segura confirmada -- ClearScreen tiene un camino
+## MC_grpSetContext/MC_grpFillRect para colores reales que no se puede
+## reproducir sin reversear MC_grp*, y DrawFillRect/DrawRoundRect/DrawEllipse
+## pasan por RGBBlend16 (alpha blending per-pixel no confirmado). TODAVIA SIN
+## MEDIR en consola real -- default OFF, ver build.sh --fastclear-neon-test.
+option(FASTCLEAR_NEON_OPTIMIZE "Replace CGsGraphics::FastClearNonClipping with a verified-faithful reimplementation that collapses per-row memset into one contiguous call when possible (experimental, not yet measured on hardware)" OFF)
+if (FASTCLEAR_NEON_OPTIMIZE)
+  add_definitions(-DZENONIA_FASTCLEAR_OPTIMIZE=1)
+endif()
+if (FASTCLEAR_NEON_OPTIMIZE AND INSTRUMENT_CGSGRAPHICS_CALLS)
+  message(FATAL_ERROR "FASTCLEAR_NEON_OPTIMIZE e INSTRUMENT_CGSGRAPHICS_CALLS no pueden estar ON a la vez -- ambos instalan un hook sobre el mismo simbolo (CGsGraphics::FastClearNonClipping)")
+endif()
+
+## Fase 43: Reemplaza las rutinas de RLE de sprites (DrawOP_COPY_Compress_16 y ENLARGE)
+## en `SetZeroBlendFunc` por las versiones decompiladas en C de Ghidra, pero compiladas
+## para ARMv7 con optimizaciones modernas (-O3, NEON) en vez del viejo ARMv5 del motor.
+option(SPRITE_DECODE_OPTIMIZE "Replace ARMv5 RLE assembly with Vita native optimized C code for drawing sprites" OFF)
+if (SPRITE_DECODE_OPTIMIZE)
+  add_definitions(-DZENONIA_SPRITE_DECODE_OPTIMIZE=1)
+endif()
+
+
+## optimization_ideas.md #3 (Fase 41): subidas asincronas del framebuffer
+## RGB565 via PBO (glGenBuffers/glMapBuffer/glUnmapBuffer) en vez de pasar el
+## puntero de pixeles directo a glTexSubImage2D -- solo tiene sentido junto
+## con RGB565_DIRECT_UPLOAD. RIESGO REAL Y CONOCIDO (ver Fase 36): sin el
+## codigo fuente de vitaGL no se pudo confirmar que su glTexSubImage2D
+## realmente honre un GL_PIXEL_UNPACK_BUFFER en vez de tratar el argumento
+## `pixels=NULL` como un puntero real -- si NO lo honra, esto es un NULL
+## deref garantizado (crash). Es exactamente el tipo de incertidumbre que
+## antes se evitaba probar sin datos reales; ahora se implementa la tecnica
+## correcta segun el contrato real de la API GL y se deja que la consola real
+## de la respuesta (ver build.sh --pbo-test) en vez de seguir sin confirmar.
+option(PBO_ASYNC_UPLOAD "Upload the RGB565 framebuffer through a pixel-unpack PBO (glMapBuffer/glUnmapBuffer) instead of passing the CPU pointer directly to glTexSubImage2D (experimental, REAL crash risk if vitaGL does not honor GL_PIXEL_UNPACK_BUFFER -- see CMakeLists.txt comment)" OFF)
+if (PBO_ASYNC_UPLOAD)
+  add_definitions(-DZENONIA_PBO_UPLOAD=1)
+endif()
+
+## optimization_ideas.md #10 (Fase 41), reinterpretado: el rasterizador de
+## software del motor es opaco (funciones "Zero" resueltas por puntero en
+## tiempo de ejecucion, ver g_funcZeroCopy/g_funcEnlarge en out_ghidra.c) --
+## parchearlo para dibujar filas pares/impares alternadas, como pedia la idea
+## original, no es seguro sin una ronda de reversing que todavia no se hizo.
+## En cambio, esta version aplica el mismo concepto (mitad del ancho de banda
+## por diseno, no solo "si cambio poco" como DIRTY_RECT_UPLOAD) en la capa de
+## SUBIDA del framebuffer: alterna que filas (pares/impares) se suben a la
+## textura cada frame via glTexSubImage2D por fila -- mas llamadas GL que el
+## build normal (fila por fila en vez de un solo bloque), asi que el
+## resultado neto en este hardware es una pregunta real, no asumida. Solo
+## tiene sentido junto con RGB565_DIRECT_UPLOAD. Ver build.sh
+## --interlaced-test.
+option(INTERLACED_UPLOAD "Upload only even/odd framebuffer rows per frame (alternating), halving upload bytes by design at the cost of many more glTexSubImage2D calls -- experimental, not yet measured (only active together with RGB565_DIRECT_UPLOAD)" OFF)
+if (INTERLACED_UPLOAD)
+  add_definitions(-DZENONIA_INTERLACED_UPLOAD=1)
+endif()
+if (INTERLACED_UPLOAD AND DIRTY_RECT_UPLOAD)
+  message(FATAL_ERROR "INTERLACED_UPLOAD y DIRTY_RECT_UPLOAD no pueden estar ON a la vez -- ambos son estrategias distintas para el mismo #elif en glTexSubImage2D_wrapper (loader/dynlib.c loader/sprite_decode.c), solo una puede aplicarse por build")
+endif()
+
+## Variante 1 (--skip-blit-test, 2026-07-19): experimento de TECHO. Convierte
+## PutCompressImg (el blitter de sprites del hot path) en un no-op -> los
+## sprites no se dibujan, pero se mide el FPS maximo teorico si el costo del
+## blit por software se eliminara. Decide si vale la pena el offload a GPU
+## (Variante 2). NO es jugable. Ver loader/dynlib.c (PutCompressImg_hook).
+option(SKIP_SPRITE_BLIT "Make PutCompressImg a no-op to measure the FPS ceiling if the software sprite blit were removed (diagnostic, sprites vanish)" OFF)
+if (SKIP_SPRITE_BLIT)
+  add_definitions(-DZENONIA_SKIP_SPRITE_BLIT=1)
+endif()
+
+## Variante 2 (--gpu-quads-test, 2026-07-19): offload de sprites COPY del hot
+## path a quads texturizados en GPU (vitaGL) con cache de decode reusando el
+## decoder real del motor. Idea #1+#5 de optimization_ideas.md. Ver
+## loader/gpu_quads.c. EXPERIMENTAL: compositing hibrido (posibles problemas de
+## capa), varios supuestos del motor sin verificar en hardware.
+option(GPU_QUADS "Offload COPY sprites to GPU textured quads via vitaGL with a decode cache (experimental, hybrid compositing)" OFF)
+if (GPU_QUADS)
+  add_definitions(-DZENONIA_GPU_QUADS=1)
+endif()
+
+## Variante 3 (--downsample-test, 2026-07-19): resolucion INTERNA reducida
+## (GAME_W/H = 960x544 * DS_NUM/DS_DEN) con upscale por GPU. AVISO: este motor
+## fusiona FOV y resolucion (verificado en out_ghidra.c), asi que ESTO ZOOMEA
+## la vista -- reproduce, a un ratio suave, lo que el usuario ya vio. Ver
+## loader/main.c (macros GAME_W/H). DS_NUM/DS_DEN configurables.
+option(DOWNSAMPLE_RENDER "Reduce internal render resolution by DS_NUM/DS_DEN and GPU-upscale (WARNING: zooms the view -- the engine fuses FOV and resolution)" OFF)
+set(DS_NUM "2" CACHE STRING "Downsample numerator (internal res = 960x544 * DS_NUM/DS_DEN)")
+set(DS_DEN "3" CACHE STRING "Downsample denominator")
+if (DOWNSAMPLE_RENDER)
+  add_definitions(-DZENONIA_DOWNSAMPLE=1 -DZENONIA_DS_NUM=${DS_NUM} -DZENONIA_DS_DEN=${DS_DEN})
+endif()
+
 ## Nombre base del .self/.vpk generado -- separado de PROJECT_NAME (que sigue
 ## siendo el nombre del target de compilacion) para poder generar un VPK con
 ## nombre distinto en la misma build tree sin pisar build/zenonia_4.vpk, p.ej.
@@ -156,6 +254,17 @@ elseif (INSTRUMENT_HOTPATH_CALLS)
 endif()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
+# El toolchain vitasdk actual usa GCC 15.2, que (desde GCC 14) promueve estas
+# categorias a ERROR por defecto. El codigo vendorizado (loader/so_util.c
+# etc.) fue escrito para un GCC mas viejo donde eran solo warnings y compilaba
+# limpio. Las bajamos de vuelta a warnings para no tener que parchear codigo
+# vendorizado por una diferencia de version del compilador (no son bugs reales).
+# OJO: "-Wno-error=return-mismatch" NO es una opcion valida de este GCC (cc1
+# la rechaza con "no option '-Wreturn-mismatch'" -- nunca existio con ese
+# nombre en el front-end de C, se confunde con el "-Wargument-mismatch" de
+# Fortran) -- quitada; los 4 flags restantes ya cubren los casos reales de
+# GCC 14+ (incluidos los mismatches de tipo de retorno via puntero).
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration -Wno-error=implicit-int")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 # ATTRIBUTE2=12 pide el presupuesto de memoria extendido -- sin esto,
 # SceShaccCg (compilador de shaders Cg de vitaGL) puede fallar al iniciar.
@@ -173,7 +282,8 @@ link_directories(
 
 add_executable(${PROJECT_NAME}
   ./loader/main.c
-  ./loader/dynlib.c
+  ./loader/dynlib.c loader/sprite_decode.c
+  ./loader/gpu_quads.c
   ./loader/so_util.c
   ./loader/java.c
   ./loader/audio.c
@@ -213,6 +323,17 @@ target_link_libraries(${PROJECT_NAME}
   SceKernelDmacMgr_stub
   taihen_stub
   kubridge_stub
+  # La vitaGL/vitashark instaladas por vdpm (2026, gcc 15.2) estan compiladas
+  # con C++ y usan std::string, operator new/delete y excepciones -> hace falta
+  # la runtime real de C++. Va al final (resolucion izq->der del linker).
+  stdc++
+  supc++
+  # dynlib.c define sus propios stubs no-op de 3 simbolos del ABI de C++
+  # (__cxa_begin_cleanup/__cxa_call_unexpected/__cxa_type_match) para el .so
+  # Android; libstdc++ tambien los define -> "multiple definition". Dejamos que
+  # el linker tome el primero (los del loader) en vez de fallar; el resto del
+  # ABI de excepciones lo aporta libstdc++.
+  -Wl,--allow-multiple-definition
 )
 
 ## Crear archivos de Vita

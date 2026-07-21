@@ -2,6 +2,9 @@
 Zenonia 4 · PSVita Port
 </h1>
 <p align="center">
+  <img src="sce_sys/livearea/contents/bg0.png" alt="Zenonia 4 PSVita Port">
+</p>
+<p align="center">
   <a href="#setup-instructions-for-players">How to install</a> •
   <a href="#controls">Controls</a> •
   <a href="#faq">FAQ</a> •

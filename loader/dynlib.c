@@ -18,6 +18,9 @@
 #include <arm_neon.h>
 #include "so_util.h"
 #include "neon_mem.h"
+#ifdef ZENONIA_GPU_QUADS
+#include "gpu_quads.h"
+#endif
 
 extern void game_log(const char *fmt, ...);
 extern volatile int g_ui_status;
@@ -36,6 +39,12 @@ volatile unsigned int g_rgb565_uploads_this_frame = 0;
 // que el flag este OFF (el build normal no llama al helper que los toca).
 volatile unsigned int g_dirtyrect_rows_uploaded_this_frame = 0;
 volatile unsigned int g_dirtyrect_rows_total_this_frame = 0;
+
+// Fase 41 (port_progress.md), optimization_ideas.md #10 (reinterpretado --
+// ver upload_rgb565_interlaced mas abajo): igual criterio que los contadores
+// de dirty-rect de arriba, 0/0 siempre que INTERLACED_UPLOAD este OFF.
+volatile unsigned int g_interlaced_rows_uploaded_this_frame = 0;
+volatile unsigned int g_interlaced_rows_total_this_frame = 0;
 
 // Este helper (y el log SIN TOPE de glColorPointer mientras ui_status
 // estuviera en 0-2) era instrumentacion puntual de una investigacion de
@@ -282,6 +291,18 @@ volatile unsigned int g_cgxpzxani_draw_calls_this_frame = 0;
 volatile unsigned int g_cgxpzxzero_blt_calls_this_frame = 0;
 volatile unsigned int g_putcompressimg_calls_this_frame = 0;
 
+// Fase 48 (port_progress.md): diagnostico siempre activo (no detras de
+// INSTRUMENT_HOTPATH_CALLS, que casi nunca esta prendido) para responder,
+// con datos reales del proximo log, la pregunta abierta tras restringir
+// GPU_QUADS a op==0: es op==0 realmente el enumDrawOP dominante de sprites
+// jugables (personajes/espada/tiles), o la mayoria usa otro valor y quedaron
+// afuera del offload a GPU sin que hubiera regresion real (serian los mismos
+// errores gráficos preexistentes, solo la escena de la sesion es distinta)?
+volatile unsigned int g_gpu_quads_calls_this_frame = 0;
+volatile unsigned int g_gpu_quads_op0_calls_this_frame = 0;
+volatile unsigned int g_gpu_quads_cache_hit_this_frame = 0;
+volatile unsigned int g_gpu_quads_decoded_this_frame = 0;
+
 #ifdef ZENONIA_INSTRUMENT_HOTPATH
 static so_hook g_cgxpzxani_draw_hook;
 static so_hook g_cgxpzxzero_blt_hook;
@@ -353,6 +374,92 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
 #ifdef ZENONIA_INSTRUMENT_HOTPATH
     g_putcompressimg_calls_this_frame++;
 #endif
+
+#ifdef ZENONIA_GPU_QUADS
+    g_gpu_quads_calls_this_frame++;
+    // Fase 48: primera vez que se ve cada enumDrawOP real -- confirma o
+    // descarta si op==0 es realmente el caso comun de sprites jugables.
+    {
+        static int seen_op[256];
+        int op_idx = (op >= 0 && op < 256) ? op : 255;
+        if (!seen_op[op_idx]) {
+            seen_op[op_idx] = 1;
+            game_log("[GpuQuadsDiag] enumDrawOP=%d visto por primera vez (p1=%d p2=%d p3=%d p4=%d p8=%d)\n",
+                     op, p1, p2, p3, p4, p8);
+        }
+    }
+#endif
+
+#ifdef ZENONIA_SKIP_SPRITE_BLIT
+    // Variante 1 (--skip-blit-test): experimento de TECHO. PutCompressImg es el
+    // blitter real de sprites del motor (hot path confirmado: 445-547
+    // llamadas/frame en combate, Fase 38). Retornar sin dibujar nada mide el
+    // FPS maximo teorico si el costo del blit por software se eliminara por
+    // completo (los sprites simplemente no aparecen). NO es un build jugable --
+    // es la medicion que decide si vale la pena el offload a GPU (Variante 2):
+    //   - FPS salta a 30-60  -> el blit ES el cuello, la GPU vale la pena.
+    //   - FPS sigue en ~10   -> el cuello esta en otro lado (conversion/subida
+    //                           del framebuffer, o primitivas CGsGraphics).
+    // Se sigue contando (arriba) y no se llama al original. El hook queda
+    // instalado (no hace falta unhook/rehook porque no delegamos).
+    (void)p1; (void)p2; (void)p3; (void)p4; (void)p5; (void)p6; (void)op; (void)p8; (void)p9;
+    return;
+#endif
+
+#ifdef ZENONIA_GPU_QUADS
+    // Fase 50: TODOS los enumDrawOP se desvian a quads GPU (antes solo op==0,
+    // Fase 48), dibujados encima del FB base en el orden de llamada original.
+    // El decode reusa el blitter REAL del motor con el op REAL (nada de
+    // adivinar formatos por op, la leccion de la Fase 48): decode dual sobre
+    // fondo negro y blanco -> alpha por pixel exacto para cualquier operador
+    // afin en dest, textura premultiplicada (ver gpu_quads.h). Solo se desvia
+    // si p9==0 (destino = pantalla principal): si el motor esta componiendo
+    // hacia un buffer alternativo propio, se respeta el camino de software.
+    // Sprites que se salen del scratch (parcialmente fuera de pantalla, p.ej.
+    // tiles en los bordes con la camara en movimiento) tambien caen al camino
+    // de software: el motor los clippea y quedan en el FB base (debajo de los
+    // quads) -- aceptable porque los tiles no se solapan entre si.
+    if (p9 == 0) {
+        if (op == 0) g_gpu_quads_op0_calls_this_frame++;
+        if (gpu_quads_lookup_and_enqueue(p5, p6, op, p8, p1, p2, p3, p4)) {
+            g_gpu_quads_cache_hit_this_frame++;
+            return; // cache hit: quad encolado, no rasterizar por CPU
+        }
+        void *fake_fb = gpu_quads_begin_pass(p3, p4, 0x0000);
+        if (!fake_fb) {
+            // Fase 51 (2026-07-20): diagnostico para el reporte del usuario de
+            // sprite del mapa/casas/bordes del mundo faltantes.
+            // NOTA: Con la correccion de Fase 54 (decodificar en 0,0), esto solo
+            // ocurre si el sprite es gigante (> GPU_QUADS_MAX_W).
+            static int reject_log = 0;
+            if (reject_log < 40) {
+                game_log("[GpuQuadsDiag] fallback a software: op=%d p1=%d p2=%d p3=%d p4=%d p8=%d (fuera del scratch 960x544 o sprite > 1024x1024, ver gpu_quads.h)\n",
+                         op, p1, p2, p3, p4, p8);
+                reject_log++;
+            }
+        }
+        if (fake_fb) {
+            g_gpu_quads_decoded_this_frame++;
+            int dual = (op != 2); // op 2 = additive: una sola pasada (gpu_quads.h)
+            so_unhook(&g_putcompressimg_hook);
+            void (*orig)(int, int, int, int, unsigned char *, unsigned short *, int, int, long) =
+                (void (*)(int, int, int, int, unsigned char *, unsigned short *, int, int, long))
+                (g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr);
+            orig(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada negra
+            if (dual) {
+                gpu_quads_capture_pass1(p3, p4);
+                gpu_quads_begin_pass(p3, p4, 0xFFFF);
+                orig(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada blanca
+            }
+            g_putcompressimg_hook = hook_addr(
+                g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr,
+                (uintptr_t) PutCompressImg_hook);
+            gpu_quads_finish_decode(p5, p6, op, p8, p1, p2, p3, p4, dual);
+            return; // quad encolado
+        }
+    }
+#endif
+
     if (p9 != 0 && (unsigned long) p9 < ZENONIA_MIN_PLAUSIBLE_HEAP_ADDR) {
         static int guard_log = 0;
         if (guard_log < 20) {
@@ -369,6 +476,278 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
         g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr,
         (uintptr_t) PutCompressImg_hook);
 }
+
+#ifdef ZENONIA_GPU_QUADS
+// --- Fase 59 (port_progress.md): CGxFACharCache::DrawToFrameBuffer -> quads GPU ---
+//
+// Hallazgo clave (leyendo out_ghidra.c a fondo, no adivinando): TODO el texto
+// del motor (tips, dialogos, descripciones, guardado, opciones, ayuda -- todo
+// lo que NO es un sprite .pzx) se dibuja via CGxFACharCache::drawString ->
+// DrawQueueChars -> DrawToFrameBuffer, un blend alpha-sobre-RGB565 manual que
+// escribe DIRECTO al framebuffer de software (confirmado en
+// out_ghidra.c:9872-10154) -- NUNCA pasa por PutCompressImg, a diferencia de
+// lo que asumia el resumen de la Fase 50 ("el motor blitea los glifos el
+// mismo -> pasan por PutCompressImg"). Esa asuncion nunca se verifico contra
+// el .so real para este call site especifico.
+//
+// Por que esto oculta el texto bajo GPU_QUADS: la arquitectura de la Fase 50
+// compone el framebuffer de software COMPLETO como una sola capa base, SIEMPRE
+// debajo de TODOS los quads de sprites del frame (ver gpu_quads_flush,
+// llamado una sola vez, justo despues del unico glDrawArrays que presenta esa
+// capa). El texto queda atrapado en esa capa base -- cualquier sprite/panel
+// desviado a GPU_QUADS que el motor dibuje DESPUES del texto en la MISMA
+// llamada (p.ej. un panel de dialogo dibujado encima de texto que deberia
+// quedar debajo, o cualquier sprite en la misma zona) termina tapandolo
+// SIEMPRE, sin importar el orden real de llamadas -- porque los quads se
+// dibujan en un solo batch al final, y la capa base (con el texto adentro)
+// siempre va primero. Fix: sacar el texto de la capa base por completo y
+// encolarlo como un quad mas, en la MISMA cola que los sprites
+// (gpu_quads_enqueue_text) -- su posicion en la cola pasa a reflejar el
+// momento real en que el motor lo dibujo, igual que un sprite.
+//
+// Formato de datos confirmado en out_ghidra.c:
+//   - CharUnitInfo (param_1): +8 = puntero a bytes de cobertura 0-255 (el
+//     char-cache SOLO guarda alfa, confirmado tambien en
+//     CopyPixelsToCharCacheBuffer via el comentario de java.c), +0xc = ancho
+//     del glifo (tambien el STRIDE del buffer de alfa, sin padding), +0x10 =
+//     alto.
+//   - this+0x48 = color de texto actual, pero NO como RGB565 crudo:
+//     CGxFACharCache::setColor565 lo reempaqueta a R5/G6/B5 pre-posicionados
+//     para el blend (confirmado leyendo setColor565 Y los shifts que
+//     DrawToFrameBuffer aplica sobre este mismo campo -- son inversos exactos).
+//   - El clip contra la ventana de texto activa (GxFont_GetCommonInfo(), +0x38
+//     x, +0x3c y, +0x40 ancho, +0x44 alto) se replica tal cual (formula
+//     literal de out_ghidra.c:9917-9943, incluida su asimetria entre
+//     clip-izquierda y clip-derecha -- no se "corrigio" por las dudas, un
+//     glifo individual practicamente nunca choca contra ambos bordes del
+//     clip a la vez en el juego real).
+//
+// Se hookea DIRECTO (no via un puntero "framebuffer alternativo" como el p9
+// de PutCompressImg -- DrawToFrameBuffer no tiene ese parametro, obtiene el
+// destino via una llamada virtual interna) y NUNCA se llama al original: el
+// quad reemplaza el efecto visual completo del blend, asi que la capa base de
+// software queda limpia (solo primitivas CGsGraphics), consistente con la
+// asuncion de diseno de la Fase 50.
+static so_hook g_drawtoframebuffer_hook;
+static uintptr_t g_gxfont_getcommoninfo_addr = 0;
+
+static int DrawToFrameBuffer_hook(void *this_ptr, void *char_unit_info, int screen_x, int screen_y) {
+    unsigned char *glyph_alpha = char_unit_info ? *(unsigned char **) ((char *) char_unit_info + 8) : NULL;
+    int glyph_w = char_unit_info ? *(int *) ((char *) char_unit_info + 0xc) : 0;
+    int glyph_h = char_unit_info ? *(int *) ((char *) char_unit_info + 0x10) : 0;
+
+    if (glyph_alpha && glyph_w > 0 && glyph_h > 0 && g_gxfont_getcommoninfo_addr) {
+        int (*get_common_info)(void) = (int (*)(void)) g_gxfont_getcommoninfo_addr;
+        char *ci = (char *) (uintptr_t) get_common_info();
+        if (ci) {
+            int clip_x = *(int *) (ci + 0x38);
+            int clip_y = *(int *) (ci + 0x3c);
+            int clip_w = *(int *) (ci + 0x40);
+            int clip_h = *(int *) (ci + 0x44);
+
+            int x = screen_x, y = screen_y;
+            int left_off = 0, top_off = 0, vis_w, vis_h;
+            if (x < clip_x) { left_off = clip_x - x; x = clip_x; vis_w = glyph_w - left_off; }
+            else { vis_w = glyph_w; }
+            { int clip_right = clip_x + clip_w; if (clip_right < x + glyph_w) vis_w = clip_right - (x + left_off); }
+
+            if (y < clip_y) { top_off = clip_y - y; y = clip_y; vis_h = glyph_h - top_off; }
+            else { vis_h = glyph_h; }
+            { int clip_bottom = clip_y + clip_h; if (clip_bottom < y + glyph_h) vis_h = clip_bottom - (y + top_off); }
+
+            if (vis_h >= 1 && vis_w > 0) {
+                uint32_t reg = *(uint32_t *) ((char *) this_ptr + 0x48);
+                int r5 = (int) ((reg << 8) >> 27);
+                int g6 = (int) ((reg << 16) >> 26);
+                int b5 = (int) (reg & 0xff) >> 3;
+                unsigned char r8 = (unsigned char) ((r5 << 3) | (r5 >> 2));
+                unsigned char g8 = (unsigned char) ((g6 << 2) | (g6 >> 4));
+                unsigned char b8 = (unsigned char) ((b5 << 3) | (b5 >> 2));
+                const unsigned char *sub_alpha = glyph_alpha + (size_t) glyph_w * top_off + left_off;
+                gpu_quads_enqueue_text(sub_alpha, glyph_w, r8, g8, b8, x, y, vis_w, vis_h);
+            }
+        }
+    }
+    return 1; // ningun call site real (DrawQueueChars/drawChar) usa el retorno
+}
+
+// Llamar junto con zenonia_install_hotpath_probe (mismo momento del boot).
+void zenonia_install_text_quads_hook(so_module *mod) {
+    g_gxfont_getcommoninfo_addr = so_symbol(mod, "GxFont_GetCommonInfo");
+    uintptr_t draw_to_fb_addr = so_symbol(mod, "_ZN14CGxFACharCache17DrawToFrameBufferEPN4gxfa12CharUnitInfoEii");
+    if (draw_to_fb_addr && g_gxfont_getcommoninfo_addr) {
+        g_drawtoframebuffer_hook = hook_addr(draw_to_fb_addr, (uintptr_t) DrawToFrameBuffer_hook);
+        game_log("[TextQuads] hook instalado en CGxFACharCache::DrawToFrameBuffer (0x%08x)\n", (unsigned int) draw_to_fb_addr);
+    } else {
+        game_log("[TextQuads] simbolo CGxFACharCache::DrawToFrameBuffer o GxFont_GetCommonInfo no encontrado -- el texto sigue con el bug de orden de capas\n");
+    }
+    so_flush_caches(mod);
+}
+
+// --- Fase 61 (port_progress.md): Screen_RGBBLEND16_Real -> quads GPU ---
+//
+// Segundo caso del MISMO bug de la Fase 59 (texto), esta vez para rellenos
+// solidos con alpha: `CGsGraphics::DrawFillRect`/`DrawRoundRect`/
+// `DrawFillEllipse`/etc. (out_ghidra.c, ~13 primitivas ya instrumentadas en
+// la Fase 36) llaman a `RGBBlend16`/`g_funcRGBBlend16` para pintar un
+// rectangulo de color+alpha DIRECTO al framebuffer de software -- es
+// exactamente el mecanismo candidato para el fondo negro/traslucido de los
+// cuadros de tips/guardado/objetos recogidos que el usuario reporto
+// invisible tras la Fase 60 (el fix de esa fase, acotado por tamano de quad,
+// no podia arreglar esto porque el problema real nunca fue glColorPointer --
+// el log de la Fase 60 confirmo CERO usos de un color-array UByte chico
+// durante toda la sesion, descartando esa hipotesis).
+//
+// `RGBBlend16` (simbolo real, `_Z10RGBBlend16iiiiji`) es un wrapper delgado
+// que llama a traves de un puntero de funcion global (`g_funcRGBBlend16`,
+// mismo patron de indireccion ya usado para `g_funcZeroCopy`/`g_funcEnlarge`
+// en sprite_decode.c) -- pero la MAYORIA de los call sites reales del .so
+// llaman a `g_funcRGBBlend16` DIRECTO, sin pasar por el wrapper (confirmado
+// con >15 call sites via grep en out_ghidra.c), asi que hookear el wrapper
+// solo capturaria una fraccion de los casos. En cambio se hookea
+// `Screen_RGBBLEND16_Real` (`_Z22Screen_RGBBLEND16_Realiiiiji`) -- la funcion
+// REAL a la que `g_funcRGBBlend16` apunta tras `CMvGraphics::InitialBlend()`
+// (`SetScreenEffectFunc(1, Screen_RGBBLEND16_16+1, Screen_RGBBLEND16_Real+1)`,
+// confirmado en out_ghidra.c) -- hookear la funcion final por DIRECCION
+// intercepta TODOS los call sites sin importar si llegan via el wrapper o
+// directo por el puntero, igual que PutCompressImg_hook.
+//
+// Formato de parametros confirmado en out_ghidra.c: `(x,y,w,h,color565,alpha4)`
+// -- `color565` es RGB565 estandar (confirmado con las mascaras de bits de
+// `Screen_RGBBLEND16_16`, p.ej. 0x8610 = bit MSB de cada canal en el orden
+// R:15-11/G:10-5/B:4-0 exacto de RGB565), `alpha4` es 0-15 (4 bits, NO 0-255
+// -- confirmado en `Screen_RGBBLEND16_Real`: `(uint)param_6 < 0x10`, y en
+// `CGsGraphics::DrawFillRect`: `RGBBlend16(...,iVar2>>4)` donde iVar2 es el
+// alpha real 0-255 de `CGcxGraphicContext::GetAlpha()`).
+//
+// `Screen_RGBBLEND16_Real` YA clippea (x,y,w,h) contra los limites del main
+// screen buffer antes de escribir -- no hace falta replicar ese clip aca (a
+// diferencia del clip de texto de la Fase 59, que es contra una ventana
+// LOCAL de dialogo, no la pantalla): un quad GL que cae fuera del viewport
+// simplemente no se rasteriza, mismo resultado.
+static so_hook g_rgbblend16_hook;
+
+static void Screen_RGBBLEND16_Real_hook(int x, int y, int w, int h, unsigned int color565, int alpha4) {
+    if (w <= 0 || h <= 0) return;
+    if (alpha4 < 0) alpha4 = 0;
+    if (alpha4 > 15) alpha4 = 15;
+    int alpha8 = (alpha4 * 255) / 15;
+
+    int r5 = (color565 >> 11) & 0x1F, g6 = (color565 >> 5) & 0x3F, b5 = color565 & 0x1F;
+    unsigned char r8 = (unsigned char) ((r5 << 3) | (r5 >> 2));
+    unsigned char g8 = (unsigned char) ((g6 << 2) | (g6 >> 4));
+    unsigned char b8 = (unsigned char) ((b5 << 3) | (b5 >> 2));
+
+    // Fase 63/64 (diagnostico ya retirado, port_progress.md): confirmo que
+    // este mecanismo SI se llama durante gameplay real -- entre otras cosas,
+    // el minimapa se dibuja como CIENTOS de bloques individuales de 4x4/4x20
+    // pixeles (un RGBBlend16 por punto de terreno/marcador), no como un solo
+    // sprite/relleno -- volumen mucho mayor de lo esperado. El log del
+    // diagnostico confirmo esto pero su propio costo (scan lineal de 128
+    // entradas EN CADA llamada, para siempre, no solo las primeras N) se
+    // sumaba al de convertir cada uno de esos cientos de bloques en un quad
+    // GPU -- contribuyo al bajon de FPS reportado en un area nueva con mucho
+    // detalle de minimapa. Retirado -- ya cumplio su proposito.
+    gpu_quads_enqueue_fill(r8, g8, b8, (unsigned char) alpha8, x, y, w, h);
+    // Nunca se llama al original -- el quad reemplaza el efecto visual
+    // completo, la capa base de software queda limpia (mismo criterio que
+    // DrawToFrameBuffer_hook, Fase 59).
+}
+
+// --- Fase 62 (port_progress.md): CGsGraphics::DrawNativeFillEllipse -> quads GPU ---
+//
+// Tercer caso del mismo bug de fondo (Fase 59 texto, Fase 61 RGBBlend16):
+// `CGsGraphics::DrawFillRoundRect` (out_ghidra.c:24187), para radios de
+// esquina > 7px, dibuja las 4 esquinas via `DrawNativeFillEllipse` (una por
+// cuadrante, bitmask `param_6`=1/2/4/8) y SOLO el centro/cruz via
+// `RGBBlend16` (ya cubierto por la Fase 61) -- si el cuadro de "objeto
+// recogido" usa esquinas redondeadas grandes, sus 4 esquinas quedarian sin
+// cubrir por el fix de la Fase 61 (candidato para "le falta el fondo negro
+// transparente" reportado especificamente en ESE cuadro, a diferencia de
+// tips/guardado que ya se ven bien).
+//
+// `DrawNativeFillEllipse` es COMPLETAMENTE autonoma -- rasteriza la elipse Y
+// hace su propio blend alpha por pixel, escribiendo directo al framebuffer
+// (`GcxGetMainScreenBuffer()`) sin pasar por `RGBBlend16` en absoluto (codigo
+// de blend duplicado, no una llamada mas al mismo mecanismo). Formato de
+// color CONFIRMADO en out_ghidra.c (dual, a diferencia de RGBBlend16): si
+// `color < 0x10000` es RGB565 crudo con alpha implicito 0xFF (opaco); si no,
+// es ARGB8888 real (`alpha=color>>24`, R/G/B en los bytes siguientes).
+//
+// LIMITACION CONOCIDA Y ACEPTADA (documentada, no oculta): el hook reproduce
+// el rectangulo COMPLETO x,y,w,h como relleno solido, no la forma de arco
+// exacta del cuadrante -- las esquinas quedan CUADRADAS en vez de
+// redondeadas (unos pocos pixeles de diferencia visual, el radio tipico de
+// una UI). Preferido sobre no hacer nada: pasar de "fondo completamente
+// invisible" a "fondo visible con esquinas apenas cuadradas" es una mejora
+// neta aunque no sea pixel-perfect: replicar el arco exacto necesitaria una
+// textura con mascara de alfa por cuadrante, no solo un quad solido.
+//
+// SALVAGUARDA: `DrawFillEllipse` (circulos/ovalos genuinos, no esquinas de
+// rounded-rect) llama a esta MISMA funcion con `quadrant=0xf` (los 4 bits a
+// la vez, ver out_ghidra.c:24181) -- desviar ESE caso a un quad cuadrado
+// SI seria una regresion real (un circulo/ovalo autentico de la UI, no una
+// esquina chica, se veria como un cuadrado solido en vez de redondo). Solo se
+// desvia cuando `quadrant` tiene EXACTAMENTE UN bit prendido (1/2/4/8 --
+// el patron real de las 4 llamadas de esquina en DrawFillRoundRect); para
+// cualquier otro valor (0xf u otra combinacion) se delega al original, sin
+// cambiar el comportamiento actual (ni mejor ni peor que antes de este fix).
+static so_hook g_drawnativefillellipse_hook;
+
+static void DrawNativeFillEllipse_hook(void *this_ptr, int x, int y, int w, int h,
+                                        unsigned int color, int quadrant) {
+    int is_single_corner = quadrant != 0 && (quadrant & (quadrant - 1)) == 0;
+    if (!is_single_corner) {
+        so_unhook(&g_drawnativefillellipse_hook);
+        ((void (*)(void *, int, int, int, int, unsigned int, int))
+            (g_drawnativefillellipse_hook.thumb_addr ? g_drawnativefillellipse_hook.thumb_addr : g_drawnativefillellipse_hook.addr))
+            (this_ptr, x, y, w, h, color, quadrant);
+        g_drawnativefillellipse_hook = hook_addr(
+            g_drawnativefillellipse_hook.thumb_addr ? g_drawnativefillellipse_hook.thumb_addr : g_drawnativefillellipse_hook.addr,
+            (uintptr_t) DrawNativeFillEllipse_hook);
+        return;
+    }
+
+    unsigned char r8, g8, b8, a8;
+    if (color < 0x10000) {
+        int r5 = (color >> 11) & 0x1F, g6 = (color >> 5) & 0x3F, b5 = color & 0x1F;
+        r8 = (unsigned char) ((r5 << 3) | (r5 >> 2));
+        g8 = (unsigned char) ((g6 << 2) | (g6 >> 4));
+        b8 = (unsigned char) ((b5 << 3) | (b5 >> 2));
+        a8 = 255;
+    } else {
+        a8 = (unsigned char) (color >> 24);
+        r8 = (unsigned char) (color >> 16);
+        g8 = (unsigned char) (color >> 8);
+        b8 = (unsigned char) color;
+    }
+    // Fase 63/64: diagnostico ya retirado, ver el comentario en
+    // Screen_RGBBLEND16_Real_hook -- cumplio su proposito, su propio costo
+    // (scan lineal en cada llamada) contribuia al bajon de FPS.
+
+    gpu_quads_enqueue_fill(r8, g8, b8, a8, x, y, w, h);
+}
+
+void zenonia_install_screen_fill_quads_hook(so_module *mod) {
+    uintptr_t addr = so_symbol(mod, "_Z22Screen_RGBBLEND16_Realiiiiji");
+    if (addr) {
+        g_rgbblend16_hook = hook_addr(addr, (uintptr_t) Screen_RGBBLEND16_Real_hook);
+        game_log("[FillQuads] hook instalado en Screen_RGBBLEND16_Real (0x%08x)\n", (unsigned int) addr);
+    } else {
+        game_log("[FillQuads] simbolo Screen_RGBBLEND16_Real no encontrado -- los rellenos solidos (fondos de dialogo, etc.) siguen con el bug de orden de capas\n");
+    }
+
+    uintptr_t ellipse_addr = so_symbol(mod, "_ZN11CGsGraphics21DrawNativeFillEllipseEiiiij17EnumGsDegreeCCW90");
+    if (ellipse_addr) {
+        g_drawnativefillellipse_hook = hook_addr(ellipse_addr, (uintptr_t) DrawNativeFillEllipse_hook);
+        game_log("[FillQuads] hook instalado en DrawNativeFillEllipse (0x%08x)\n", (unsigned int) ellipse_addr);
+    } else {
+        game_log("[FillQuads] simbolo DrawNativeFillEllipse no encontrado -- esquinas redondeadas grandes siguen con el bug de orden de capas\n");
+    }
+
+    so_flush_caches(mod);
+}
+#endif // ZENONIA_GPU_QUADS
 
 // Llamar DESPUES de so_relocate/so_resolve, igual que
 // zenonia_install_hide_dpad_hook/zenonia_install_drawnative_probe. La
@@ -663,6 +1042,126 @@ void zenonia_install_cgsgraphics_probe(so_module *mod) {
 #endif
 }
 
+// --- Fase 41 (port_progress.md): optimizacion REAL (no solo conteo) de
+// CGsGraphics::FastClearNonClipping -- optimization_ideas.md, "Lo que NO se
+// ha hecho" #3.
+//
+// A diferencia de ClearScreen (tiene un camino MC_grpSetContext/MC_grpFillRect
+// para colores "reales" que no podemos reimplementar sin reversear MC_grp*) y
+// DrawFillRect/DrawRoundRect/DrawEllipse (pasan por RGBBlend16, alpha blending
+// per-pixel cuyo comportamiento con distintos valores de alpha no esta
+// confirmado), FastClearNonClipping SI tiene una implementacion simple y
+// totalmente confirmada contra el pseudo-C real de Ghidra
+// (decompiled/libgameDSO_armeabi/ghidra/out_ghidra.c:22992-23014):
+//
+//   undefined8 CGsGraphics::FastClearNonClipping(this, x, y, w, h) {
+//       iVar3 = (*(int**)(this+8))[0x11];               // row_off
+//       iVar4 = *(int*)(**(int**)(this+8) + 0x10);        // fb_base
+//       ppiVar1 = (int**)GcxGetMainScreenBuffer();
+//       iVar2 = **ppiVar1 << ((*ppiVar1)[3] >> 4 & 0xff); // stride (bytes/fila)
+//       __s = fb_base + iVar2*(y + row_off) + x*2;        // RGB565 -- x*2 confirma 2 bytes/pixel
+//       for (row = 0; row < h; row++) { memset(__s, 0, w*2); __s += iVar2; }
+//       return CONCAT44(w, this);
+//   }
+//
+// Es un clear a NEGRO incondicional (memset a 0, sin color -- a diferencia de
+// ClearScreen), row por row. La unica optimizacion real y segura posible sin
+// arriesgar una regresion visual: cuando el rectangulo es de ANCHO COMPLETO
+// (stride == w*2, el caso comun de un clear de pantalla/fondo sin recorte
+// horizontal), las filas son contiguas en memoria y se puede reemplazar el
+// loop de H llamadas a memset por UNA sola memset(stride*h bytes) -- mismos
+// bytes, mismo valor, mismo puntero inicial, sin cambiar el resultado. Cuando
+// el rectangulo SI esta recortado horizontalmente (stride != w*2), se hace el
+// mismo loop por fila que el original pero via neon_memset (loader/neon_mem.c)
+// en vez de la memset de libc.
+//
+// Reemplaza la funcion COMPLETA (no llama al original) -- no hay ciclo
+// unhook/llamar-original/rehook, asi que esto NO esta expuesto a la clase de
+// bug de reinstalacion de las Fases 37-40 (esos bugs eran todos sobre hooks
+// que se reinstalan en cada invocacion; este hook se instala UNA vez y ya).
+//
+// Retorno: el pseudo-C devuelve CONCAT44(w, this) (64 bits: r1=w, r0=this) --
+// ningun caller confirmado lo consume, pero se replica igual por las dudas
+// (misma leccion de la Fase 38: no asumir que un valor de retorno no importa).
+#ifdef ZENONIA_FASTCLEAR_OPTIMIZE
+// GcxGetMainScreenBuffer vive dentro de libgameDSO.so (simbolo global sin
+// mangling C++, ver "int GcxGetMainScreenBuffer(void);" en out_ghidra.h) -- no
+// esta linkeado con nuestro loader, hay que resolverlo con so_symbol() en la
+// instalacion del hook y llamarlo a traves de un puntero a funcion, igual que
+// PutCompressImg_hook/etc. llaman al original.
+typedef int (*GcxGetMainScreenBuffer_fn)(void);
+static GcxGetMainScreenBuffer_fn g_GcxGetMainScreenBuffer = NULL;
+
+static long long CGsGraphics_FastClearNonClipping_neon_hook(void *this_ptr, int x, int y, int w, int h) {
+    intptr_t this_i = (intptr_t) this_ptr;
+    int *field8 = *(int **) (this_i + 8);
+    int row_off = field8[0x11];
+    int fb_base = *(int *) (intptr_t) (field8[0] + 0x10);
+
+    int **ppi = (int **) (intptr_t) g_GcxGetMainScreenBuffer();
+    int *inner = *ppi;
+    int stride = inner[0] << ((inner[3] >> 4) & 0xff);
+
+    uint8_t *s = (uint8_t *) (intptr_t) (fb_base + stride * (y + row_off) + x * 2);
+    size_t row_bytes = (size_t) w * 2;
+
+    if (h > 0) {
+#ifdef ZENONIA_GPU_QUADS
+        uint32_t ckey32 = 0x0001 | (0x0001 << 16);
+        if ((size_t) stride == row_bytes) {
+            uint32_t *d32 = (uint32_t *)s;
+            size_t count = (row_bytes * (size_t) h) / 4;
+            for (size_t i = 0; i < count; i++) d32[i] = ckey32;
+        } else {
+            for (int row = 0; row < h; row++) {
+                uint32_t *d32 = (uint32_t *)s;
+                size_t count = row_bytes / 4;
+                for (size_t i = 0; i < count; i++) d32[i] = ckey32;
+                s += stride;
+            }
+        }
+#else
+        if ((size_t) stride == row_bytes) {
+            neon_memset(s, 0, row_bytes * (size_t) h);
+        } else {
+            for (int row = 0; row < h; row++) {
+                neon_memset(s, 0, row_bytes);
+                s += stride;
+            }
+        }
+#endif
+    }
+
+    return ((long long) (uint32_t) (uintptr_t) this_ptr) | ((long long) (uint32_t) w << 32);
+}
+#endif
+
+// Llamar DESPUES de so_relocate/so_resolve, igual que
+// zenonia_install_cgsgraphics_probe. NO instalar junto con
+// INSTRUMENT_CGSGRAPHICS_CALLS -- ambos hookean el mismo simbolo
+// (CGsGraphics::FastClearNonClipping); CMakeLists.txt ya lo valida con un
+// FATAL_ERROR si los dos flags terminan ON a la vez.
+void zenonia_install_fastclear_optimize(so_module *mod) {
+#ifdef ZENONIA_FASTCLEAR_OPTIMIZE
+    uintptr_t gcx_addr = so_symbol(mod, "GcxGetMainScreenBuffer");
+    uintptr_t addr = so_symbol(mod, "_ZN11CGsGraphics20FastClearNonClippingEiiii");
+    if (gcx_addr && addr) {
+        g_GcxGetMainScreenBuffer = (GcxGetMainScreenBuffer_fn) gcx_addr;
+        static so_hook hook;
+        hook = hook_addr(addr, (uintptr_t) CGsGraphics_FastClearNonClipping_neon_hook);
+        (void) hook;
+        so_flush_caches(mod);
+        game_log("[FastClearOptimize] hook instalado en FastClearNonClipping (0x%08x), GcxGetMainScreenBuffer=0x%08x\n",
+                 (unsigned int) addr, (unsigned int) gcx_addr);
+    } else {
+        game_log("[FastClearOptimize] simbolo FastClearNonClipping (0x%08x) o GcxGetMainScreenBuffer (0x%08x) no encontrado -- optimizacion NO esta activa\n",
+                 (unsigned int) addr, (unsigned int) gcx_addr);
+    }
+#else
+    (void) mod;
+#endif
+}
+
 // Stub para __errno
 int* __errno(void) {
     static int dummy_errno = 0;
@@ -713,7 +1212,6 @@ void *convert_rgb565_to_rgba8888(const void *pixels, int width, int height) {
 
     int i = 0;
     int npix8 = npix & ~7; // multiplo de 8 mas cercano hacia abajo
-    uint8x8_t a8 = vdup_n_u8(0xFF);
     for (; i < npix8; i += 8) {
         uint16x8_t p = vld1q_u16(src + i);
 
@@ -725,24 +1223,30 @@ void *convert_rgb565_to_rgba8888(const void *pixels, int width, int height) {
         uint16x8_t g8_16 = vorrq_u16(vshlq_n_u16(g6, 2), vshrq_n_u16(g6, 4));
         uint16x8_t b8_16 = vorrq_u16(vshlq_n_u16(b5, 3), vshrq_n_u16(b5, 2));
 
+        // Color-key 0x0001 -> alpha 0, else 0xFF (base FB background)
+        uint16x8_t is_ckey = vceqq_u16(p, vdupq_n_u16(0x0001));
+        uint8x8_t alpha = vmvn_u8(vmovn_u16(is_ckey));
+
         uint8x8x4_t rgba;
-        rgba.val[0] = vmovn_u16(r8_16);
-        rgba.val[1] = vmovn_u16(g8_16);
-        rgba.val[2] = vmovn_u16(b8_16);
-        rgba.val[3] = a8;
+        rgba.val[0] = vand_u8(vmovn_u16(r8_16), alpha);
+        rgba.val[1] = vand_u8(vmovn_u16(g8_16), alpha);
+        rgba.val[2] = vand_u8(vmovn_u16(b8_16), alpha);
+        rgba.val[3] = alpha;
         vst4_u8(dst + i * 4, rgba); // interleaved R,G,B,A directo a memoria
     }
 
-    // Cola escalar (npix no multiplo de 8) -- misma formula de replicacion
-    // de bits, para que no haya una costura visible entre el tramo NEON y
-    // el escalar.
+    // Cola escalar (npix no multiplo de 8)
     for (; i < npix; i++) {
         uint16_t p = src[i];
-        uint32_t r5 = (p >> 11) & 0x1F, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
-        uint32_t r = (r5 << 3) | (r5 >> 2);
-        uint32_t g = (g6 << 2) | (g6 >> 4);
-        uint32_t b = (b5 << 3) | (b5 >> 2);
-        ((uint32_t *) dst)[i] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        if (p == 0x0001) {
+            ((uint32_t *) dst)[i] = 0x00000000u;
+        } else {
+            uint32_t r5 = (p >> 11) & 0x1F, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
+            uint32_t r = (r5 << 3) | (r5 >> 2);
+            uint32_t g = (g6 << 2) | (g6 >> 4);
+            uint32_t b = (b5 << 3) | (b5 >> 2);
+            ((uint32_t *) dst)[i] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        }
     }
 
     static int conv_log = 0;
@@ -823,6 +1327,99 @@ static void upload_rgb565_dirty_rect(GLenum target, GLint level, GLint xoffset, 
 }
 #endif
 
+#ifdef ZENONIA_INTERLACED_UPLOAD
+// Fase 41 (port_progress.md), optimization_ideas.md #10 -- REINTERPRETADO.
+//
+// La idea original pide parchear el rasterizador de software del motor para
+// que dibuje filas pares/impares alternadas por frame (ahorro de CPU real).
+// Eso requiere offsets reales de Ghidra sobre las funciones "Zero"
+// (g_funcZeroCopy/g_funcEnlarge/etc en out_ghidra.c), que son punteros a
+// funcion resueltos en tiempo de ejecucion -- mismo tipo de riesgo que la
+// Fase 31/32, no confirmado todavia (ver optimization_ideas.md, "Lo que NO se
+// ha hecho" #1 y el hallazgo de la Fase 41 en port_progress.md: el modo
+// ENLARGE de PutCompressImg escala hacia ARRIBA, no hacia abajo, asi que ni
+// siquiera sirve como atajo para esto).
+//
+// Esta version aplica el mismo concepto (mitad del ancho de banda por
+// DISENO, a diferencia de DIRTY_RECT_UPLOAD que depende de cuanto cambio
+// realmente) en la capa de SUBIDA que si controlamos por completo: cada
+// frame sube solo las filas de una paridad (pares en frames pares, impares
+// en frames impares) del framebuffer RGB565 ya renderizado por el motor. El
+// motor sigue renderizando TODAS las filas en CPU igual que siempre -- esto
+// NO reduce el costo de render por software (ese sigue intacto), solo el
+// ancho de banda CPU->GPU de la subida, y punto medible por separado si vale
+// la pena.
+//
+// glTexSubImage2D no tiene forma de subir filas alternadas en una sola
+// llamada (el destino siempre es un rango contiguo) -- esto implica height/2
+// llamadas individuales de 1 fila cada una en vez de 1 sola llamada de
+// buffer completo. Si el overhead por-llamada de esta vitaGL domina sobre el
+// ahorro de bytes, el resultado neto puede ser una regresion -- exactamente
+// el tipo de dato real que se busca con este build de prueba (ver
+// build.sh --interlaced-test), no algo asumido de antemano.
+static void upload_rgb565_interlaced(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                      GLsizei width, GLsizei height, GLenum format, GLenum type,
+                                      const void *pixels) {
+    static int parity = 0;
+
+    const uint8_t *cur = (const uint8_t *) pixels;
+    size_t row_bytes = (size_t) width * sizeof(uint16_t);
+    int uploaded = 0;
+
+    for (int row = parity; row < height; row += 2) {
+        glTexSubImage2D(target, level, xoffset, yoffset + row, width, 1,
+                         format, type, cur + (size_t) row * row_bytes);
+        uploaded++;
+    }
+
+    g_interlaced_rows_total_this_frame += height;
+    g_interlaced_rows_uploaded_this_frame += uploaded;
+
+    parity ^= 1;
+}
+#endif
+
+// --- Fase 49/50: sombra del estado GL que el motor cree vigente ---
+// gpu_quads_flush() (llamado en glDrawArrays_wrapper justo despues del draw
+// real del motor) pisa punteros de arrays (a un array LOCAL del flush que
+// muere al retornar), textura ligada, blend, color, client states y matrix
+// mode. GLES1/vitaGL no tiene glPushAttrib, asi que trackeamos aca lo ultimo
+// que el motor seteo (todos sus GL calls pasan por los wrappers de esta
+// tabla) y lo re-aplicamos despues del flush -- el motor asume que su estado
+// GL persiste entre llamadas y frames. Sin esto, el siguiente draw del motor
+// salia con punteros colgantes y arrays deshabilitados (la causa raiz de "los
+// textos no aparecen" de la Fase 49, log_1784510991.txt).
+static GLuint g_engine_bound_tex = 0;
+static GLenum g_engine_blend_src = GL_ONE;
+static GLenum g_engine_blend_dst = GL_ZERO;
+static int g_engine_blend_on = 0;
+static int g_engine_tex2d_on = 0;
+static int g_engine_cs_vertex = 0, g_engine_cs_color = 0, g_engine_cs_texcoord = 0;
+static GLenum g_engine_matrix_mode = GL_MODELVIEW;
+static float g_engine_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+// Ultimos punteros NO-fixed pasados directo a GL (los GL_FIXED no hace falta
+// trackearlos: pending_fixed_* los re-aplica la conversion de
+// glDrawArrays_wrapper, que corre DESPUES del flush).
+typedef struct { GLint size; GLenum type; GLsizei stride; const void *ptr; int valid; } gl_ptr_shadow;
+static gl_ptr_shadow g_engine_vp = {0}, g_engine_cp = {0}, g_engine_tp = {0};
+
+#ifdef ZENONIA_GPU_QUADS
+static void gpu_quads_restore_engine_state(void) {
+    glMatrixMode(g_engine_matrix_mode);
+    glBindTexture(GL_TEXTURE_2D, g_engine_bound_tex);
+    if (g_engine_tex2d_on) glEnable(GL_TEXTURE_2D); else glDisable(GL_TEXTURE_2D);
+    if (g_engine_blend_on) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glBlendFunc(g_engine_blend_src, g_engine_blend_dst);
+    glColor4f(g_engine_color[0], g_engine_color[1], g_engine_color[2], g_engine_color[3]);
+    if (g_engine_cs_vertex) glEnableClientState(GL_VERTEX_ARRAY); else glDisableClientState(GL_VERTEX_ARRAY);
+    if (g_engine_cs_color) glEnableClientState(GL_COLOR_ARRAY); else glDisableClientState(GL_COLOR_ARRAY);
+    if (g_engine_cs_texcoord) glEnableClientState(GL_TEXTURE_COORD_ARRAY); else glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    if (g_engine_vp.valid) glVertexPointer(g_engine_vp.size, g_engine_vp.type, g_engine_vp.stride, g_engine_vp.ptr);
+    if (g_engine_cp.valid) glColorPointer(g_engine_cp.size, g_engine_cp.type, g_engine_cp.stride, g_engine_cp.ptr);
+    if (g_engine_tp.valid) glTexCoordPointer(g_engine_tp.size, g_engine_tp.type, g_engine_tp.stride, g_engine_tp.ptr);
+}
+#endif
+
 // El motor sube su framebuffer interno de software (400x240, ver Fase 1 del
 // plan) en RGB565 -- vitaGL no lo maneja igual que el motor original espera,
 // asi que se convierte a RGBA8888 en CPU antes de subirlo. Mismo bug
@@ -839,6 +1436,10 @@ void glTexImage2D_wrapper(GLenum target, GLint level, GLint internalformat, GLsi
         g_rgb565_uploads_this_frame++;
     }
 
+// Fase 50: el FB base vuelve a subirse DIRECTO en RGB565 tambien en builds
+// GPU_QUADS (los quads ahora se dibujan ENCIMA del FB opaco, no debajo -- ya
+// no hace falta canal alfa en el FB, y la conversion por CPU de la Fase 49
+// era la regresion de FPS del log_1784517442.txt).
 #ifdef ZENONIA_RGB565_DIRECT
     // Prueba A/B (ver CMakeLists.txt RGB565_DIRECT_UPLOAD, port_progress.md
     // Fase 22/24): saltar por completo convert_rgb565_to_rgba8888() y subir el
@@ -880,10 +1481,17 @@ void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yo
         g_rgb565_uploads_this_frame++;
     }
 
+// Fase 50: subida directa tambien en GPU_QUADS (ver glTexImage2D_wrapper).
 #ifdef ZENONIA_RGB565_DIRECT
 #ifdef ZENONIA_DIRTY_RECT_UPLOAD
     if (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5 && pixels) {
         upload_rgb565_dirty_rect(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    } else {
+        glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
+    }
+#elif defined(ZENONIA_INTERLACED_UPLOAD)
+    if (format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5 && pixels) {
+        upload_rgb565_interlaced(target, level, xoffset, yoffset, width, height, format, type, pixels);
     } else {
         glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
     }
@@ -919,6 +1527,10 @@ static GLint pending_fixed_color_size = 0;
 static GLsizei pending_fixed_color_stride = 0;
 static GLfloat *fixed_color_buf = NULL;
 static int fixed_color_buf_cap = 0;
+
+static const uint8_t *pending_ubyte_colors = NULL;
+static GLint pending_ubyte_color_size = 0;
+static GLsizei pending_ubyte_color_stride = 0;
 
 static const int32_t *pending_fixed_texcoords = NULL;
 static GLint pending_fixed_texcoord_size = 0;
@@ -967,6 +1579,86 @@ void glDrawArrays_wrapper(GLenum mode, GLint first, GLsizei count) {
             }
         }
         glColorPointer(pending_fixed_color_size, GL_FLOAT, 0, fixed_color_buf);
+    } else if (pending_ubyte_colors) {
+        // Fase 60 (2026-07-20): blanquear este array SOLO cuando el quad que
+        // se esta dibujando cubre (aprox) la pantalla completa -- el UNICO
+        // caso confirmado con evidencia real (Fase 51-53, 500+ frames en 3
+        // pantallas) de que este mecanismo trae basura/memoria sin
+        // inicializar. Blanquear CUALQUIER uso (Fase 58) rompio el fondo
+        // oscuro/traslucido de los cuadros de tips/guardado -- ver el
+        // comentario largo en glColorPointer_wrapper.
+        float quad_w = 0.0f, quad_h = 0.0f;
+        int have_extent = 0;
+        {
+            const float *v = NULL;
+            int stride_elems = 0, comp = 2;
+            if (pending_fixed_verts) {
+                v = fixed_vert_buf;
+                comp = pending_fixed_size;
+                stride_elems = comp;
+            } else if (g_engine_vp.valid && g_engine_vp.type == GL_FLOAT && g_engine_vp.ptr) {
+                v = (const float *) g_engine_vp.ptr;
+                comp = g_engine_vp.size;
+                stride_elems = g_engine_vp.stride > 0 ? (int)(g_engine_vp.stride / sizeof(float)) : comp;
+            }
+            if (v && comp >= 2 && count > 0) {
+                float minx = 1e30f, maxx = -1e30f, miny = 1e30f, maxy = -1e30f;
+                for (int i = first; i < first + count; i++) {
+                    const float *p = v + (size_t) i * stride_elems;
+                    if (p[0] < minx) minx = p[0];
+                    if (p[0] > maxx) maxx = p[0];
+                    if (p[1] < miny) miny = p[1];
+                    if (p[1] > maxy) maxy = p[1];
+                }
+                quad_w = maxx - minx;
+                quad_h = maxy - miny;
+                have_extent = 1;
+            }
+        }
+        int force_white = have_extent && quad_w > 900.0f && quad_h > 500.0f;
+
+        static uint8_t white_buf[65536 * 4];
+        static int white_ready = 0;
+        const uint8_t *color_src = pending_ubyte_colors;
+        int color_stride = pending_ubyte_color_stride > 0 ? pending_ubyte_color_stride : pending_ubyte_color_size;
+
+        static int white_log = 0, pass_log = 0, unknown_log = 0;
+        if (force_white) {
+            if (!white_ready) { memset(white_buf, 0xFF, sizeof(white_buf)); white_ready = 1; }
+            if (white_log < 20) {
+                game_log("[GpuQuadsDiag] color-array blanqueado (quad %.0fx%.0f, pantalla completa) ui_status=%d\n",
+                         quad_w, quad_h, g_ui_status);
+                white_log++;
+            }
+            color_src = white_buf;
+            color_stride = 4;
+        } else if (have_extent) {
+            if (pass_log < 20) {
+                game_log("[GpuQuadsDiag] color-array UByte SIN tocar (quad %.0fx%.0f, no es pantalla completa) color=(%d,%d,%d,%d) ui_status=%d\n",
+                         quad_w, quad_h, pending_ubyte_colors[0], pending_ubyte_colors[1],
+                         pending_ubyte_colors[2], pending_ubyte_colors[3], g_ui_status);
+                pass_log++;
+            }
+        } else if (unknown_log < 20) {
+            game_log("[GpuQuadsDiag] color-array UByte con extent DESCONOCIDO (sin vertices float/fixed detectados) color=(%d,%d,%d,%d) ui_status=%d\n",
+                     pending_ubyte_colors[0], pending_ubyte_colors[1], pending_ubyte_colors[2], pending_ubyte_colors[3], g_ui_status);
+            unknown_log++;
+        }
+
+        int needed_verts = first + count;
+        int needed_floats = needed_verts * pending_ubyte_color_size;
+        if (needed_floats > fixed_color_buf_cap) {
+            fixed_color_buf = (GLfloat *)realloc(fixed_color_buf, needed_floats * sizeof(GLfloat));
+            fixed_color_buf_cap = needed_floats;
+        }
+        for (int i = 0; i < needed_verts; i++) {
+            const uint8_t *src = color_src + i * color_stride;
+            GLfloat *dst = fixed_color_buf + i * pending_ubyte_color_size;
+            for (int c = 0; c < pending_ubyte_color_size; c++) {
+                dst[c] = src[c] / 255.0f;
+            }
+        }
+        glColorPointer(pending_ubyte_color_size, GL_FLOAT, 0, fixed_color_buf);
     }
 
     if (pending_fixed_texcoords) {
@@ -987,11 +1679,56 @@ void glDrawArrays_wrapper(GLenum mode, GLint first, GLsizei count) {
         glTexCoordPointer(pending_fixed_texcoord_size, GL_FLOAT, 0, fixed_texcoord_buf);
     }
 
+    // Fase 51 (2026-07-20): se probo forzar blend aca para el splash oscuro,
+    // pero el razonamiento era invalido -- el destino ya es NEGRO en este
+    // punto (glClearColor(0,0,0,1) en main.c antes de cada frame), y
+    // blendear un tinte no-blanco contra negro nunca puede dar blanco. La
+    // causa real (el array de color siempre trae (168,26,16,129) en vez de
+    // blanco) se arreglo de raiz en glColorPointer_wrapper (Fase 53) --
+    // forzar blend aca quedo sin objeto (con el array ya blanco, blend
+    // encendido o apagado da el mismo resultado) y se elimino.
     glDrawArrays(mode, first, count);
+
+#ifdef ZENONIA_GPU_QUADS
+    // Fase 50: dibujar los quads encolados JUSTO DESPUES del draw del motor
+    // (el del FB base, opaco, que queda DEBAJO) -- los sprites van encima en
+    // su orden de llamada original. Si el flush dibujo algo, restaurar el
+    // estado GL del motor (el flush pisa punteros/textura/blend/color/
+    // client states y el motor asume que su estado persiste entre frames).
+    if (gpu_quads_flush() > 0) {
+        gpu_quads_restore_engine_state();
+    }
+#endif
 }
 
 void glTexEnvf_wrapper(GLenum target, GLenum pname, GLfloat param) {
     game_log("[GL] glTexEnvf target=%x pname=%x param=%f ui_status=%d\n", target, pname, param, g_ui_status);
+    // Fase 52 (2026-07-20): diagnostico/guardia para el reporte del usuario de
+    // fondo negro persistente en splash Y title (deberia ser blanco). Este
+    // call SOLO ocurre 2 veces en TODO el run (confirmado en
+    // log_1784520216.txt, justo al crear la textura del FB) con
+    // pname=GL_TEXTURE_ENV_MODE (0x2200) y param=480.0 luego 0.0 -- ninguno de
+    // los dos es un enum GL_TEXTURE_ENV_MODE valido (MODULATE=8448,
+    // DECAL=8449, GL_BLEND=8450, REPLACE=7681, ADD=260, COMBINE=34192). Real
+    // GL rechaza un enum invalido (GL_INVALID_ENUM) y deja el modo anterior
+    // sin tocar (default = MODULATE); si vitaGL en cambio ACEPTA 0.0 tal cual
+    // sin validar, la textura del FB podria terminar en un modo de combine
+    // roto -- aplicado UNA vez, pero afectando TODOS los frames/pantallas
+    // subsiguientes por igual (consistente con "tanto splash como title"
+    // reportado). Se guardan estas 2 llamadas especificas (no se reenvian a
+    // vitaGL) para que el modo quede en lo que vitaGL ya trae por default;
+    // si esto no cambia nada visualmente, descarta esta hipotesis para el
+    // proximo log.
+    if (pname == GL_TEXTURE_ENV_MODE &&
+        param != GL_MODULATE && param != GL_DECAL && param != GL_BLEND &&
+        param != GL_REPLACE && param != GL_ADD && param != GL_COMBINE) {
+        static int guard_log = 0;
+        if (guard_log < 20) {
+            game_log("[GpuQuadsDiag] glTexEnvf: pname=TEXTURE_ENV_MODE con param=%f invalido -- IGNORADO (modo previo intacto)\n", param);
+            guard_log++;
+        }
+        return;
+    }
     glTexEnvf(target, pname, param);
 }
 
@@ -1001,6 +1738,8 @@ void glBlendFunc_wrapper(GLenum sfactor, GLenum dfactor) {
         game_log("[GL] glBlendFunc sfactor=%x dfactor=%x ui_status=%d\n", sfactor, dfactor, g_ui_status);
         log++;
     }
+    g_engine_blend_src = sfactor;
+    g_engine_blend_dst = dfactor;
     glBlendFunc(sfactor, dfactor);
 }
 
@@ -1010,6 +1749,8 @@ void glEnable_wrapper(GLenum cap) {
         game_log("[GL] glEnable cap=%x\n", cap);
         enable_log++;
     }
+    if (cap == GL_BLEND) g_engine_blend_on = 1;
+    else if (cap == GL_TEXTURE_2D) g_engine_tex2d_on = 1;
     glEnable(cap);
 }
 
@@ -1019,7 +1760,36 @@ void glDisable_wrapper(GLenum cap) {
         game_log("[GL] glDisable cap=%x\n", cap);
         disable_log++;
     }
+    if (cap == GL_BLEND) g_engine_blend_on = 0;
+    else if (cap == GL_TEXTURE_2D) g_engine_tex2d_on = 0;
     glDisable(cap);
+}
+
+// Fase 49: wrapper de glBindTexture para trackear la textura ligada del motor
+// (antes iba directo a vitaGL) -- gpu_quads_flush() liga sus propias texturas
+// y hay que poder restaurar la del motor, y ademas asi se detecta cual textura
+// es la del FB base (la que recibe subidas RGB565).
+void glBindTexture_wrapper(GLenum target, GLuint texture) {
+    if (target == GL_TEXTURE_2D) g_engine_bound_tex = texture;
+    glBindTexture(target, texture);
+}
+
+// Fase 49: wrapper de glColor4f para trackear el color del motor (antes iba
+// directo) -- gpu_quads_flush() lo pisa con su alpha por-quad.
+void glColor4f_wrapper(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
+    g_engine_color[0] = r; g_engine_color[1] = g;
+    g_engine_color[2] = b; g_engine_color[3] = a;
+    glColor4f(r, g, b, a);
+}
+
+// Fase 49: BUG REAL corregido -- glColor4x estaba mapeado a
+// glClearColorx_wrapper ("using same logic as glClearColorx for now"), que
+// llama a glClearColor: cada vez que el motor seteaba el color/alpha de
+// vertice en punto fijo (fades de logo/textos, tintes), en realidad cambiaba
+// el CLEAR COLOR y el color de vertice quedaba intacto. Ahora convierte
+// Q16.16 -> float y llama a glColor4f de verdad.
+void glColor4x_wrapper(int r, int g, int b, int a) {
+    glColor4f_wrapper(r / 65536.0f, g / 65536.0f, b / 65536.0f, a / 65536.0f);
 }
 
 void glTexCoordPointer_wrapper(GLint size, GLenum type, GLsizei stride, const void *pointer) {
@@ -1043,14 +1813,19 @@ void glTexCoordPointer_wrapper(GLint size, GLenum type, GLsizei stride, const vo
         log_uvs++;
     }
 
+    g_engine_cs_texcoord = 1;
     if (type == GL_FIXED) {
         pending_fixed_texcoords = (const int32_t *)pointer;
         pending_fixed_texcoord_size = size;
         pending_fixed_texcoord_stride = stride;
+        g_engine_tp.valid = 0; // lo re-aplica la conversion de glDrawArrays_wrapper
         return;
     }
 
     pending_fixed_texcoords = NULL;
+    g_engine_tp.size = size; g_engine_tp.type = type;
+    g_engine_tp.stride = stride; g_engine_tp.ptr = pointer;
+    g_engine_tp.valid = 1;
     glTexCoordPointer(size, type, stride, pointer);
 }
 
@@ -1076,14 +1851,96 @@ void glColorPointer_wrapper(GLint size, GLenum type, GLsizei stride, const void 
         log_colors++;
     }
 
+    // Fase 52 (2026-07-20): diagnostico dedicado para el reporte del usuario
+    // de fondo negro persistente en splash Y title (deberia ser blanco). El
+    // log_colors de arriba se agota (cap=20) dentro de las primeras 2-3
+    // llamadas de TODO el run, asi que no alcanza para saber si este color
+    // realmente cambia con el tiempo (una animacion de fade legitima) o si
+    // esta CLAVADO en el mismo valor sin importar la pantalla (splash vs
+    // title) -- lo segundo apuntaria a memoria stale/no inicializada en vez
+    // de un fade real. Solo loguea cuando el VALOR cambia (deduplicado),
+    // capado a 200 cambios distintos (irrelevante en cache, solo 4 bytes de
+    // comparacion por llamada).
+    if (pointer && size == 4 && type == GL_UNSIGNED_BYTE) {
+        static uint8_t last_val[4] = {0xEE, 0xEE, 0xEE, 0xEE}; // sentinel invalido
+        static int change_log = 0;
+        const uint8_t *c = (const uint8_t *) pointer;
+        if (change_log < 200 && memcmp(c, last_val, 4) != 0) {
+            game_log("[GpuQuadsDiag] color-array RGBA cambio a (%d,%d,%d,%d) ptr=%p ui_status=%d\n",
+                     c[0], c[1], c[2], c[3], pointer, g_ui_status);
+            memcpy(last_val, c, 4);
+            change_log++;
+        }
+    }
+
+    g_engine_cs_color = 1;
     if (type == GL_FIXED) {
         pending_fixed_colors = (const int32_t *)pointer;
         pending_fixed_color_size = size;
         pending_fixed_color_stride = stride;
+        g_engine_cp.valid = 0; // lo re-aplica la conversion de glDrawArrays_wrapper
         return;
     }
 
     pending_fixed_colors = NULL;
+    pending_ubyte_colors = NULL;
+
+    // Fase 53 (2026-07-20): fix confirmado para el fondo negro/oscuro
+    // (splash Y title, reportado identico en ambos) y candidato fuerte para
+    // "falta el sprite del mapa/casas/bordes" y "las fuentes se saltan".
+    // Evidencia: `nm -D --undefined-only libgameDSO.so` confirma que el .so
+    // real NUNCA importa glColor4f/glColor4x/glBlendFunc/glAlphaFunc -- el
+    // UNICO mecanismo de tinte de vertice en TODO el binario es este array de
+    // glColorPointer. El diagnostico de la Fase 52 (dedupe por valor) mostro
+    // que a lo largo de 500+ frames, atravesando splash (ui_status=-1),
+    // transicion (19) y title/menu (14), este array SIEMPRE trae el mismo
+    // valor (168,26,16,129) -- nunca otro. Esto tiñe TODO lo que se presenta
+    // en pantalla (la textura del framebuffer completo, incluyendo bordes,
+    // texto cacheado y sprites de fondo ya renderizados correctamente en el
+    // framebuffer de software) con un multiplicador oscuro constante -- lo
+    // que ya es dim/tenue (bordes del mundo, texto) puede volverse
+    // practicamente invisible contra un fondo ya oscurecido. Se neutraliza a
+    // blanco opaco (equivalente al color "current" default de GL, que este
+    // motor tampoco toca jamas ya que no importa glColor4f/x). ADVERTENCIA:
+    // es un workaround empirico, no un fix de causa raiz confirmada -- el
+    // origen real de por que ese puntero siempre trae (168,26,16,129) en vez
+    // de blanco no se identifico (no hay JNI de color/fade/tint relacionado
+    // en java.c). Si mas adelante aparece un uso LEGITIMO de este mecanismo
+    // con otro valor (un flash de dano, un dialogo tintado), esto lo
+    // blanquearia tambien -- sin evidencia de eso en las +500 frames
+    // observadas hasta ahora.
+    // Fase 58 (2026-07-20): el match exacto de la Fase 53 (168,26,16,129) era
+    // demasiado angosto -- un log posterior mostro el MISMO mecanismo con un
+    // valor DISTINTO (232,23,16,129), que no matchea el hardcode.
+    // Fase 60 (2026-07-20): blanquear SIEMPRE (sin condicionar al valor, el
+    // fix de la Fase 58) resulto DEMASIADO amplio -- el usuario reporto que el
+    // fondo negro del cuadro de tips/guardado desaparecio y "se distorsiona
+    // completamente" (un cuadro que deberia quedar oscuro/traslucido sale
+    // blanco Y OPACO, porque el `white_buf` fuerza alpha=255 tambien -- ver
+    // abajo). No hay evidencia de que ESE cuadro use el mismo mecanismo con
+    // otro valor "legitimo" (el log solo mostro UN cambio de valor en toda la
+    // sesion), pero tampoco hay evidencia de que NO lo use -- forzar blanco
+    // aca, en base al VALOR nomas, no puede distinguir entre ambos casos.
+    // Por eso la decision de blanquear se movio a `glDrawArrays_wrapper`
+    // (donde ya se conoce el tamano real del quad en pantalla): el UNICO caso
+    // confirmado con evidencia real (Fase 51-53, 500+ frames en 3 pantallas)
+    // es el quad de PRESENTACION DE PANTALLA COMPLETA (960x544) -- cualquier
+    // otro uso de este mecanismo, sea el tamano que sea, se deja pasar tal
+    // cual llega del motor (su alpha/color originales, no forzados a
+    // blanco/opaco) hasta tener evidencia real de que tambien esta roto.
+    if (type == GL_UNSIGNED_BYTE && size == 4) {
+        pending_ubyte_colors = (const uint8_t *) pointer;
+        pending_ubyte_color_size = size;
+        pending_ubyte_color_stride = stride;
+        g_engine_cp.size = size; g_engine_cp.type = type;
+        g_engine_cp.stride = stride; g_engine_cp.ptr = pointer;
+        g_engine_cp.valid = 0; // la decision de blanquear (o no) se toma en glDrawArrays_wrapper
+        return;
+    }
+
+    g_engine_cp.size = size; g_engine_cp.type = type;
+    g_engine_cp.stride = stride; g_engine_cp.ptr = pointer;
+    g_engine_cp.valid = 1;
     glColorPointer(size, type, stride, pointer);
 }
 
@@ -1108,14 +1965,19 @@ void glVertexPointer_wrapper(GLint size, GLenum type, GLsizei stride, const void
         log_verts++;
     }
 
+    g_engine_cs_vertex = 1;
     if (type == GL_FIXED) {
         pending_fixed_verts = (const int32_t *)pointer;
         pending_fixed_size = size;
         pending_fixed_stride = stride;
+        g_engine_vp.valid = 0; // lo re-aplica la conversion de glDrawArrays_wrapper
         return;
     }
 
     pending_fixed_verts = NULL;
+    g_engine_vp.size = size; g_engine_vp.type = type;
+    g_engine_vp.stride = stride; g_engine_vp.ptr = pointer;
+    g_engine_vp.valid = 1;
     glVertexPointer(size, type, stride, pointer);
 }
 
@@ -1125,6 +1987,9 @@ void glEnableClientState_wrapper(GLenum array) {
         game_log("[GL] glEnableClientState array=%x\n", array);
         enable_cs_log++;
     }
+    if (array == GL_VERTEX_ARRAY) g_engine_cs_vertex = 1;
+    else if (array == GL_COLOR_ARRAY) g_engine_cs_color = 1;
+    else if (array == GL_TEXTURE_COORD_ARRAY) g_engine_cs_texcoord = 1;
     glEnableClientState(array);
 }
 
@@ -1134,6 +1999,9 @@ void glDisableClientState_wrapper(GLenum array) {
         game_log("[GL] glDisableClientState array=%x\n", array);
         disable_cs_log++;
     }
+    if (array == GL_VERTEX_ARRAY) g_engine_cs_vertex = 0;
+    else if (array == GL_COLOR_ARRAY) g_engine_cs_color = 0;
+    else if (array == GL_TEXTURE_COORD_ARRAY) g_engine_cs_texcoord = 0;
     glDisableClientState(array);
 }
 
@@ -1143,6 +2011,7 @@ void glMatrixMode_wrapper(GLenum mode) {
         game_log("[GL] glMatrixMode mode=%x\n", mode);
         log++;
     }
+    g_engine_matrix_mode = mode;
     glMatrixMode(mode);
 }
 
@@ -1518,12 +2387,12 @@ so_default_dynlib default_dynlib[] = {
 
     // OpenGL ES 1.1 (mapeado a vitaGL)
     { "glActiveTexture", (uintptr_t)&glActiveTexture },
-    { "glBindTexture", (uintptr_t)&glBindTexture },
+    { "glBindTexture", (uintptr_t)&glBindTexture_wrapper },
     { "glClear", (uintptr_t)&glClear },
     { "glClearColorx", (uintptr_t)&glClearColorx_wrapper },
     { "glColorPointer", (uintptr_t)&glColorPointer_wrapper },
-    { "glColor4f", (uintptr_t)&glColor4f },
-    { "glColor4x", (uintptr_t)&glClearColorx_wrapper }, /* using same logic as glClearColorx for now */
+    { "glColor4f", (uintptr_t)&glColor4f_wrapper },
+    { "glColor4x", (uintptr_t)&glColor4x_wrapper }, /* Fase 49: antes apuntaba a glClearColorx_wrapper (bug: seteaba el clear color, no el color de vertice) */
     { "glDisable", (uintptr_t)&glDisable_wrapper },
     { "glDisableClientState", (uintptr_t)&glDisableClientState_wrapper },
     { "glDrawArrays", (uintptr_t)&glDrawArrays_wrapper },

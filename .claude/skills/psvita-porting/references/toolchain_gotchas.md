@@ -31,6 +31,28 @@ falla con un error de "Compatibility with CMake < X will be removed" que aborta 
 warning), agregar `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (o el valor que pida el mensaje) al invocar `cmake`
 resuelve sin tener que tocar los `CMakeLists.txt` vendoreados de dependencias de terceros.
 
+## GCC 14+ (vitasdk moderno) promueve viejos warnings de C a error — y algunos nombres de flag "obvios" no existen
+
+Un vitasdk-gcc reciente (confirmado con GCC 15.2) hereda el cambio de GCC 14: código C vendorizado escrito
+para un compilador viejo (`implicit-function-declaration`, `implicit-int`, `int-conversion`,
+`incompatible-pointer-types` — llamar una función sin prototipo, "return" sin tipo declarado, conversiones
+implícitas int↔puntero) que antes compilaba con solo warnings ahora aborta la build con error. El fix es
+bajarlos de vuelta a warning explícitamente:
+
+```cmake
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-function-declaration -Wno-error=implicit-int")
+```
+
+**Cuidado con inventar el nombre de un quinto flag por analogía** (p.ej. `-Wno-error=return-mismatch`, que
+suena razonable para "una función retorna un tipo que no coincide con el declarado" pero **no existe** en el
+front-end de C de GCC bajo ese nombre — `cc1` lo rechaza con `no option '-Wreturn-mismatch'` y, al no
+encontrar nada parecido en C, sugiere `-Wargument-mismatch` (un flag de **Fortran**, sin relación). Ese tipo
+de mismatch ya queda cubierto por `incompatible-pointer-types`/`int-conversion` de la lista de arriba. Antes
+de agregar un `-Wno-error=X` nuevo, confirmar que `X` es un nombre de warning real de ESTE front-end
+(`gcc --help=warnings` o la documentación de GCC de la versión instalada) en vez de asumirlo por el nombre
+del error que se está viendo — un flag inventado rompe la build para TODOS los archivos, no solo el que
+disparó el error original.
+
 ## Reconfigurar antes de asumir que un flag ya está activo
 
 Si un build anterior quedó cacheado con un flag distinto (por ejemplo `EMULATOR_BUILD=ON` de una sesión de

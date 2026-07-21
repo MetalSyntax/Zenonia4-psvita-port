@@ -7,9 +7,11 @@ Recopiladas durante el port de Prince of Persia Classic. Todas asumen un proyect
 
 - **`build_and_install.sh`** — build completo vía symlink sin espacios (workaround del bug de
   `vita-pack-vpk` con rutas que contienen espacios) + instalación. Ajustar `PROJECT_DIR`/nombre del `.vpk`.
-- **`manage_vita.py`** — herramienta de despliegue y debug por FTP (VitaShell): sube el `.vpk`/`eboot.bin`,
-  descarga el log más reciente de `ux0:data/<juego>/logs/`. Editar `VITA_IP`, `VITA_PORT`,
-  `LOCAL_VPK_PATH`, `VITA_DATA_DIR` al inicio del archivo.
+- **`manage_vita.py`** — herramienta de despliegue y debug por FTP (VitaShell): opción 1 escanea
+  `BUILD_DIR` (default `build/`) y deja elegir entre TODOS los `.vpk` encontrados (útil si el proyecto
+  genera varias variantes de build, ver `build.sh`) en vez de subir un archivo fijo; también descarga el
+  log más reciente de `ux0:data/<juego>/logs/`. Editar `VITA_IP`, `VITA_PORT`, `BUILD_DIR`, `VITA_DATA_DIR`
+  al inicio del archivo.
 - **`scripts/deploy_and_launch_vita3k.sh`** — para pruebas en el emulador Vita3K (macOS): copia el
   `eboot.bin` recién compilado directo al directorio de la app instalada (sin reinstalar el `.vpk`
   completo) y relanza el emulador. Requiere el symlink `~/popc-src` y build dir descritos en el script.

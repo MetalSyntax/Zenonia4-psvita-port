@@ -1754,3 +1754,1412 @@ de repetirse idéntico — la señal de que el fix anterior sí tuvo efecto real
 - Wordwrap (`GFA_GetWordwrapPositionEx`) usa un piso de progreso mínimo en vez de la fórmula exacta (ver
   Fase 11) — el wrap visual de textos largos puede quedar imperfecto (una línea con algo más o menos
   texto del ideal) hasta confirmar la causa exacta de `maxWidth`/escala con números reales.
+
+## Fase 41: 3 implementaciones nuevas de `optimization_ideas.md` a pedido del usuario (Tabla A #3 + 2 de los
+## 10 métodos), con investigación real de Ghidra antes de escribir nada, y una idea descartada con evidencia
+## concreta (2026-07-19)
+
+El usuario pidió implementar cualquiera de los 4 puntos de "Lo que NO se ha hecho" (Tabla A) y 3 de los "10
+métodos nuevos" de `optimization_ideas.md`, cada uno en un VPK separado para medir en consola real. Antes de
+escribir un solo patch se leyó el pseudo-C real de Ghidra (`decompiled/libgameDSO_armeabi/ghidra/out_ghidra.c`)
+para las funciones involucradas — mismo criterio de siempre (medir/confirmar antes de parchear), aplicado
+esta vez a la fase de INVESTIGACIÓN, no solo a la de medición en consola.
+
+**Hallazgo que descarta Tabla A #1 (parche de escala en `PutCompressImg`) para esta ronda**: se leyó
+`PutCompressImg` completo (`out_ghidra.c:224597`) y `CGxPZxZero::Blt`/`BltFast` (sus únicos callers
+confirmados, `out_ghidra.c:247337-247381`). Dos problemas reales, no hipotéticos:
+1. El modo `ENLARGE` (`enumDrawOP=0x10`, registrado como `g_funcEnlarge` vía `SetZeroBlendFunc`) escala el
+   sprite hacia ARRIBA (`param_3 = param_8 * param_3`, un multiplicador entero de agrandado) — no hacia
+   abajo. La premisa original del plan ("ya tiene un modo ENLARGE nativo" para reducir resolución) está al
+   revés: no sirve como atajo para bajar el costo de decode.
+2. Las funciones reales de decode/blit (`g_funcZeroCopy`/`g_funcZeroBlend`/etc.) son punteros a función
+   resueltos en tiempo de ejecución (asignados vía `SetZeroBlendFunc`), y se llaman con solo 4 argumentos
+   (`dest_ptr, src_comprimido, paleta, stride`) — SIN un ancho/alto explícito. Esto sugiere que el tamaño
+   real del sprite está embebido en los datos comprimidos, no en `param_3`/`param_4` de `PutCompressImg` —
+   cambiar esos parámetros para "forzar" un tamaño menor arriesgaría corromper el destino/clipping sin
+   siquiera reducir el trabajo real de decode. Confirmar esto con certeza requeriría desensamblar las
+   implementaciones reales de `g_funcZeroCopy`/`g_funcEnlarge` (no están decompiladas como C legible, son
+   codigo ARM/NEON crudo) — una ronda de investigación aparte, no algo para asumir y parchear a ciegas en
+   esta sesión. **Tabla A #1 queda pendiente, ahora con una razón concreta documentada en vez de "todavía no
+   se intentó".**
+
+**Implementado #1 — Tabla A #3, optimización REAL (no solo conteo) de `CGsGraphics::FastClearNonClipping`**
+(`loader/dynlib.c`, flag nuevo `FASTCLEAR_NEON_OPTIMIZE`, default OFF): de las 13 primitivas que
+`INSTRUMENT_CGSGRAPHICS_CALLS` (Fase 36) solo cuenta, se leyó el pseudo-C real de las 4 con mejor chance de
+optimización segura:
+- `ClearScreen` tiene un camino `MC_grpSetContext`/`MC_grpFillRect` para colores "reales" (todo valor
+  `param_1` en `[1, 0xfffe]`) que no se puede reproducir sin reversear `MC_grp*` — descartada.
+- `DrawFillRect`/`DrawRoundRect`/`DrawEllipse` pasan por `RGBBlend16` (alpha blending per-píxel vía
+  `CGcxGraphicContext::GetAlpha()`), cuyo comportamiento con distintos valores de alpha no está confirmado —
+  descartadas (mismo motivo que #1: reimplementar a ciegas arriesga una regresión visual).
+- `FastClearNonClipping` (`out_ghidra.c:22992-23014`) SÍ es simple y 100% confirmada: un clear a NEGRO
+  incondicional (`memset` a 0, sin color), fila por fila, usando `GcxGetMainScreenBuffer()` + aritmética de
+  punteros de `this` para calcular stride/base — sin ningún camino alternativo tipo `MC_grp`/alpha blending.
+
+  Se reimplementó la función COMPLETA (reemplaza el hook, no llama al original — sin ciclo
+  unhook/original/rehook, así que esto NO está expuesto a la clase de bug de reinstalación de las Fases
+  37-40) replicando EXACTAMENTE la aritmética de direcciones del pseudo-C real (`GcxGetMainScreenBuffer`
+  resuelto vía `so_symbol` y llamado a través de un puntero de función, igual que los demás hooks que llaman
+  al original). La única optimización real: cuando el rectángulo es de ancho completo (`stride == w*2`, filas
+  contiguas en memoria — el caso común de un clear de pantalla/fondo sin recorte horizontal), colapsa el loop
+  de H llamadas a `memset` en una sola; si hay recorte horizontal, usa el mismo loop por fila pero con
+  `neon_memset` (`loader/neon_mem.c`, ya vendorizado desde la Fase 34) en vez de la `memset` de libc.
+  `CMakeLists.txt` agrega un `FATAL_ERROR` si `FASTCLEAR_NEON_OPTIMIZE` e `INSTRUMENT_CGSGRAPHICS_CALLS`
+  quedan ON a la vez (ambos hookean el mismo símbolo). Build de prueba: `./build.sh --fastclear-neon-test` →
+  `build/zenonia_4_fastclear_neon_test.vpk` — a diferencia de los demás builds de diagnóstico de este
+  proyecto, el FPS medido con este SÍ es comparable al build normal (no hay overhead de instrumentación, es
+  un reemplazo directo). **Compilado y linkeado limpio, confirmado con `nm`/`strings` sobre el ELF real que
+  el hook (`CGsGraphics_FastClearNonClipping_neon_hook`) y el log
+  `[FastClearOptimize] hook instalado en FastClearNonClipping...` están presentes — TODAVÍA SIN MEDIR FPS en
+  consola real.**
+
+**Implementado #2 — 10 métodos nuevos #10 (checkerboard/interlaced), REINTERPRETADO** (`loader/dynlib.c`,
+flag nuevo `INTERLACED_UPLOAD`, default OFF, requiere `RGB565_DIRECT_UPLOAD=ON`, mutuamente excluyente con
+`DIRTY_RECT_UPLOAD` — `CMakeLists.txt` agrega un `FATAL_ERROR` si ambos quedan ON): la idea original pide
+parchear el rasterizador de software del motor para dibujar filas pares/impares alternadas (ahorro de CPU
+real) — bloqueada por el mismo motivo que Tabla A #1 (funciones "Zero" opacas, offsets reales de Ghidra sin
+confirmar). En cambio, esta versión aplica el mismo concepto de "mitad del ancho de banda por diseño" en la
+capa de SUBIDA que sí controlamos por completo: alterna qué filas (pares/impares) del framebuffer RGB565 ya
+renderizado se suben a la textura cada frame. El motor sigue renderizando TODAS las filas en CPU igual que
+siempre — esto NO reduce el costo de render por software (sigue intacto), solo el ancho de banda de subida, y
+a un costo real: `glTexSubImage2D` no tiene forma de subir filas alternadas en una sola llamada (el destino
+siempre es un rango contiguo), así que esto implica `height/2` llamadas individuales de 1 fila en vez de 1
+sola llamada de buffer completo — si el overhead por-llamada de esta vitaGL domina sobre el ahorro de bytes,
+el resultado neto puede ser una regresión neta, exactamente el tipo de dato real que se busca medir (no algo
+asumido de antemano, mismo criterio que `DIRTY_RECT_UPLOAD` en la Fase 36). Nuevo contador
+`avg_interlaced_pct_uploaded` en el log (debería rondar 50% por diseño, a diferencia de
+`avg_dirtyrect_pct_uploaded` que depende de cuánto cambió realmente). Build de prueba:
+`./build.sh --interlaced-test` → `build/zenonia_4_interlaced_test.vpk`. **Compilado y linkeado limpio,
+confirmado con `nm`/`strings` que los contadores y el nuevo campo del log
+(`avg_interlaced_pct_uploaded=%.1f`) están presentes en el ELF real — TODAVÍA SIN MEDIR en consola real.**
+
+**Descartado con evidencia concreta, NO implementado — 10 métodos nuevos #3 (PBO/subidas asíncronas por
+DMA)**: la Fase 36 había dejado esto "sin confirmar" por no tener el código fuente de vitaGL a mano. Esta vez
+se inspeccionó directamente el header real instalado
+(`~/vitasdk/arm-vita-eabi/include/vitaGL.h`): `glGenBuffers`/`glBindBuffer`/`glBufferData`/`glMapBuffer`/
+`glUnmapBuffer` SÍ existen, pero **`GL_PIXEL_UNPACK_BUFFER` NO está definido en ningún lado del header** —
+los únicos targets de buffer bindeable que expone son `GL_ARRAY_BUFFER` y `GL_ELEMENT_ARRAY_BUFFER` (para
+datos de vértices/índices). `glTexSubImage2D` solo lee de un buffer bindeado cuando ese buffer está en el
+target `GL_PIXEL_UNPACK_BUFFER` (parte del contrato estándar de la API GL, no algo que dependa de esta
+vitaGL) — sin ese target, no hay forma real de que la subida de textura lea del PBO. Implementarlo de todos
+modos (definiendo el enum `0x88EC` a mano y esperando que la implementación lo reconozca pese a no
+declararlo) sería apostar a una API no soportada: pasar `pixels=NULL` después de bindear un target que
+`glTexSubImage2D` no espera es una dereferencia de puntero nulo prácticamente garantizada, no un experimento
+real con resultado incierto. **No se generó ningún build de prueba para esto** — es un descarte con evidencia
+concreta (el header real), no una idea pendiente de medir.
+
+**No se re-evaluaron esta ronda** (mismos motivos que la Fase 36, sin información nueva que los desbloquee):
+10 métodos nuevos #1 (GPU Hooking) y #5 (pre-descompresión de `.pzx`) siguen bloqueados por el mismo
+problema (funciones "Zero" opacas); #7 (JIT) sigue fuera de alcance realista. Adicionalmente, para #1 se
+identificó un problema arquitectónico más: aun si se pudiera decodificar un sprite a mano, dibujarlo con un
+quad de vitaGL en paralelo al framebuffer de software rompería el orden de composición (el loader sube el
+framebuffer CPU completo como UNA sola textura/quad por frame — cualquier quad GPU adicional quedaría
+siempre por encima o por debajo de TODA la escena compuesta en CPU, nunca intercalado correctamente con
+sprites que sí pasan por el framebuffer de software) — otro motivo real, no solo el codec opaco, para
+mantener esto fuera de alcance sin una reescritura mayor del pipeline (la misma clase de riesgo que la idea
+#2, threading).
+
+**Verificado en esta sesión** (con `VITASDK` real disponible en `~/vitasdk`): `zenonia_4.vpk` (normal, sin
+cambios de comportamiento — los flags nuevos son default OFF), `zenonia_4_fastclear_neon_test.vpk` y
+`zenonia_4_interlaced_test.vpk` compilan y linkean limpio, sin warnings nuevos respecto a los builds previos.
+Se confirmaron además los dos `FATAL_ERROR` de `CMakeLists.txt` (`FASTCLEAR_NEON_OPTIMIZE` +
+`INSTRUMENT_CGSGRAPHICS_CALLS`, e `INTERLACED_UPLOAD` + `DIRTY_RECT_UPLOAD`) disparando correctamente al
+forzar la combinación conflictiva vía CMake directo.
+
+**Pendiente para la próxima sesión**: instalar `zenonia_4_fastclear_neon_test.vpk` y
+`zenonia_4_interlaced_test.vpk` en consola real y comparar FPS contra el build normal (mismo tramo de combate
+de fases anteriores) — `--fastclear-neon-test` es directamente comparable al build normal (sin overhead de
+instrumentación); `--interlaced-test` hay que mirarlo junto con `avg_interlaced_pct_uploaded` (debería rondar
+50%) antes de sacar conclusiones de FPS, dado el costo conocido de más llamadas GL por frame.
+
+## Fase 42: primeros datos reales de consola para `--fastclear-neon-test` y `--interlaced-test` — ninguno de
+## los dos mejora el FPS medido, e interlaced tiene un artefacto visual real (2026-07-19)
+
+Dos logs nuevos del usuario: `log_1784480229.txt` (`--fastclear-neon-test`, confirmado por la línea
+`[FastClearOptimize] hook instalado en FastClearNonClipping...`) y `log_1784480384.txt`
+(`--interlaced-test`, confirmado por `avg_interlaced_pct_uploaded=50.0` apareciendo desde el primer
+checkpoint — el diseño de "alternar paridad cada frame" se comporta exactamente como se esperaba). Ambos
+limpios — sin `FATAL`, sin corte abrupto, sin `[PutCompressImgGuard] param_9=... invalido` — ninguno de los
+dos introdujo una regresión de estabilidad.
+
+**Números reales (`fps=` del log, mismo formato que las Fases 25/27/33/35/38)**:
+
+| Build | Checkpoints | FPS prom. | Rango | Llegó a frame |
+|---|---|---|---|---|
+| Normal (Fase 33, referencia) | 8 | ~9.6 | 7.7–11.8 | 961+ |
+| `--fastclear-neon-test` | 4 (121..481) | **7.6** | 6.6–8.6 | 481 (sesión corta) |
+| `--interlaced-test` | 5 (121..601) | **8.2** | 5.6–9.7 | 601 (sesión corta) |
+
+**Lectura honesta**: el usuario reportó "Neon no vi ninguna mejora" (refiriéndose a
+`--fastclear-neon-test` por el nombre del build, no confundir con `NEON_LIBC_INTERCEPT` de la Fase
+34/35, que es una cosa distinta) e "interlaced tiene un efecto raro y tampoco vi ninguna mejora" — el
+log confirma ambas percepciones:
+
+- **`--fastclear-neon-test` (7.6 FPS prom.) no muestra mejora sobre la referencia (~9.6)** — y de hecho el
+  promedio queda por debajo, aunque la sesión es mucho más corta (4 checkpoints hasta el frame 481, no los
+  961+ de la referencia) y con rango solapado (6.6–8.6 vs. 7.7–11.8), así que no alcanza para afirmar una
+  regresión real, solo que no hay mejora medible. Tiene sentido en retrospectiva: `FastClearNonClipping` es
+  una única primitiva de las ~13 de `CGsGraphics::` (nunca se midió qué fracción del `avg_cgsgraphics_per_frame`
+  agregado representa) frente a un hot path real de 445-547 llamadas/frame de `PutCompressImg` (Fase 38) --
+  aun optimizada a la perfección, su contribución al costo total por frame es probablemente marginal.
+- **`--interlaced-test` (8.2 FPS prom.) tampoco muestra mejora**, consistente con lo anticipado en la Fase
+  41: el costo de `height/2` llamadas individuales a `glTexSubImage2D` (272 llamadas de 1 fila en vez de 1
+  sola de buffer completo) probablemente compensa o supera el ahorro de bytes subidos. `avg_interlaced_pct_uploaded=50.0`
+  confirma que el mecanismo en sí funciona exactamente como se diseñó (no es un bug de la implementación).
+- **El "efecto raro" que reportó el usuario en interlaced es el artefacto esperado de la técnica, no un
+  bug**: al mantener la mitad de las filas del frame anterior mientras se actualiza solo la otra mitad,
+  cualquier contenido en movimiento (sprites, scroll) produce "combing"/entrelazado visible (líneas
+  pares/impares desincronizadas, el mismo artefacto que el entrelazado de video CRT clásico) — documentado
+  como riesgo conocido en el comentario de `upload_rgb565_interlaced()` (`loader/dynlib.c`), ahora confirmado
+  en la práctica. Sin mejora de FPS que lo justifique, este artefacto por sí solo ya descarta la técnica para
+  uso real.
+
+**Sobre el comentario del usuario "los logs no deben causar impacto en el performance"**: se confirmó
+revisando el código (no solo de memoria) que NINGUNO de los dos hooks nuevos de esta ronda agrega logging
+por-llamada o por-frame — `CGsGraphics_FastClearNonClipping_neon_hook()` y `upload_rgb565_interlaced()` no
+tienen ningún `game_log()` en su cuerpo; los únicos `game_log()` nuevos de la Fase 41 son 2 líneas de
+instalación que corren UNA vez al arrancar (`[FastClearOptimize] hook instalado...`). La línea periódica
+`frame N alive` sigue siendo la misma de siempre (cada 120 frames, sin cambios desde la Fase 25). El logging
+no explica la falta de mejora en ninguno de los dos builds -- ver `feedback_no_perf_impact_from_logging` en
+memoria para el criterio a aplicar de acá en adelante en cualquier hook nuevo.
+
+**Conclusión práctica**: ninguna de las 2 técnicas de esta ronda (Fase 41/42) se promueve a default --
+mismo destino que `NEON_LIBC_INTERCEPT` y `DISABLE_VSYNC` (Fase 35): implementadas, medidas en consola real,
+sin beneficio confirmado, código conservado detrás de sus flags por si se quieren retomar. De los candidatos
+evaluados hasta ahora en toda esta lista, el único con potencial real CONFIRMADO por datos (no solo
+hipótesis) sigue siendo el hot path de `PutCompressImg`/`CGxPZxZero::Blt` (445-547 llamadas/frame, Fase 38) --
+la investigación de la Fase 41 dejó como paso desensamblar las implementaciones reales de
+`g_funcZeroCopy`/`g_funcEnlarge`. Esto se completó en la Fase 43.
+
+## Fase 43: Análisis de la decodificación RLE y cierre de Tabla A #1 (2026-07-19)
+
+Se desensambló y analizó el código de `out_ghidra.c` buscando las rutinas conocidas en el motor como `g_funcZeroCopy` y `g_funcEnlarge`. Contrario a lo que se creía en la Fase 41 ("no están decompiladas como C legible"), **Ghidra SÍ logró decompilar el flujo completo en C** de ambas funciones base (`DrawOP_COPY_Compress_16` y `DrawOP_ENLARGE_Compress_16`), que se encontraron en las líneas 227093 y 220215, respectivamente.
+
+**Análisis de `DrawOP_COPY_Compress_16`**:
+- Es un loop de decodificación RLE (Run-Length Encoding).
+- Lee tokens de la imagen comprimida. Un token `0xfffe` indica "fin de línea", y avanza el puntero de destino sumándole el `stride`. Un token `0xffff` indica fin de sprite.
+- Otros tokens indican saltar píxeles transparentes o dibujar píxeles opacos desde una paleta.
+- **Hallazgo clave**: La rutina *nunca* recibe un parámetro de ancho o alto. El tamaño final del sprite en destino está implícito y embebido en el código RLE (dictado por los tokens `0xfffe` que definen dónde hacer wrap al siguiente renglón de la pantalla).
+
+**Análisis de `DrawOP_ENLARGE_Compress_16`**:
+- Recibe un parámetro adicional `param_5`.
+- Durante el dibujado, por cada píxel decodificado ejecuta dos loops anidados (de `param_5` por `param_5`) para replicar el píxel en un cuadrado de destino.
+- **Hallazgo clave**: `param_5` solo funciona como un *multiplicador entero de agrandado*. No se puede usar para saltar píxeles o achicar la imagen.
+
+**Conclusión final de la Hipótesis de Optimización**:
+La idea de Tabla A #1 ("parchear la escala en PutCompressImg para ahorrar tiempo de decodificación en CPU") queda **formalmente descartada** y cerrada con evidencia real y confirmada. El decodificador no soporta renderizar a escalas fraccionarias ni más pequeñas sin una reescritura total del parser RLE.
+
+## Fase 44: Reemplazo Nativo de Rutinas RLE (2026-07-19)
+
+Al descartar el escalado de `PutCompressImg`, la opción evidente para optimizar (Idea #5) era escribir un caché en memoria que decodificara los RLE a mapas de bits la primera vez que se renderizaran.
+Sin embargo, se identificó una mejora arquitectónica de "bajo costo y alta recompensa":
+El motor original de Android (`libgameDSO.so`) está compilado para **armeabi** (ARMv5). Sus rutinas ensambladas RLE (que dibujan la inmensa mayoría de los sprites) no utilizan instrucciones NEON y no están optimizadas para la ejecución fuera de orden de un procesador moderno (ARMv7, Cortex-A9 de PS Vita).
+
+En lugar de construir un caché pesado, se implementó un reemplazo 1 a 1 de las funciones RLE usando el código C puro rescatado por Ghidra en la Fase 43:
+- Se creó `loader/sprite_decode.c` con `DrawOP_COPY_Compress_16_Vita` y `DrawOP_ENLARGE_Compress_16_Vita`.
+- Se agregó un hook sobre `SetZeroBlendFunc` en tiempo de carga. Cuando el motor registra sus punteros a funciones para `enumDrawOP == 0` (COPY) o `0x10` (ENLARGE), el hook los sustituye por nuestras rutinas compiladas de forma nativa por GCC para PS Vita (`-O3 -mfpu=neon`).
+- Nota de implementación: El hook no sustituye (todavía) las variantes "Clipping", así que los sprites que queden parcialmente fuera de pantalla seguirán usando el código ARMv5 viejo. Esto es suficiente para un test inicial de viabilidad.
+
+**Instrumentación y Build**:
+- Nuevo flag: `SPRITE_DECODE_OPTIMIZE` (y build shortcut `./build.sh --sprite-decode-test`).
+- El build compiló exitosamente (`zenonia_4_sprite_decode_test.vpk`).
+- Próximo paso: Probar este VPK en la PS Vita y medir si ejecutar RLE nativo compilado con `-O3` genera un aumento medible en el framerate respecto a la versión emulada ARMv5.
+
+## Fase 45: primer crash real de `--sprite-decode-test` — causa raíz encontrada (la rutina RLE de la Fase
+## 44 solo reproduce UNO de al menos 4 formatos de token distintos que el motor realmente usa) y corregida
+## (2026-07-19)
+
+El usuario reportó un crash (`log_1784490541.txt` + `Zenonia4-psp2core-1784490570-0x0007542301-eboot.bin.psp2dmp`)
+con el build `--sprite-decode-test`. Triage completo siguiendo la skill `so-crash-triage` (log +
+`.psp2dmp` + `.so` real + pseudo-C de Ghidra, sin adivinar).
+
+**El log**: crash durante la carga de datos (`.zt1`) justo después de `OnUIStatusChange: 19` — antes de
+llegar siquiera al primer `frame 1 alive` (similar en momento al tercer crash de la Fase 39: durante
+menú/carga, no en combate real). Confirmado en el log: `[SpriteDecodeOptimize] hook instalado en
+SetZeroBlendFunc (0x98150761)` y `[SpriteDecodeOptimize] Reemplazado COPY (0) con rutina C Vita nativa`
+aparecen exactamente UNA vez — el motor registra sus punteros de función una sola vez al arrancar, así que
+desde ese momento **toda** la decodificación COPY de la sesión pasa por la rutina nueva de `sprite_decode.c`.
+
+**El `.psp2dmp`** (parseado con `vita-parse-core` contra el `.elf` de este build): Data abort,
+**`PC=0x9815b6c8`**. A diferencia de los crashes de la Fase 32-40 (todos con `PC` en `PutCompressImg` o
+`CGxPZxZero::Blt`), el offset contra `nm -D` sobre `lib/libgameDSO.so` resuelve esta vez a
+**`CGxPZxEffectExFrame::__Draw+0xa8`** — una función NUEVA en esta investigación, confirmando la sospecha ya
+anotada desde la Fase 31 ("hay OTROS callers de `Blt`/`PutCompressImg` además de `CGxPZxAni::Draw`,
+probablemente fondo/tiles") — en este caso, renderizado de efectos/partículas. `__Draw` itera un array de
+sub-objetos y llama a su método virtual `Blt` (vtable +0xc) para cada uno — exactamente el mismo
+`CGxPZxZero::Blt`→`PutCompressImg`→`g_funcZeroCopy` que la Fase 44 reemplazó, solo que desde un call site
+distinto. R10 volvió a mostrar `0x98195e80` (el mismo valor "residual" ya visto en las Fases 38/39, dentro
+de `.got`, no una dirección real — ruido de stack, no relacionado a este crash).
+
+**Causa raíz real, confirmada leyendo el pseudo-C real de 3 funciones hermanas (no solo la que `sprite_decode.c`
+ya había leído)**: el puntero que el motor registra de verdad para COPY no es la rutina simple
+`DrawOP_COPY_Compress_16` que la Fase 43 analizó — es `DrawOP_COPY_Compress_16_Auto`
+(`out_ghidra.c:200261`), que **redirige cualquier header en el rango `[-7,-3]`** (fórmula real:
+`-header-3 < 5`) a una tabla de 5 rutinas "Ex" con un formato de token más rico:
+
+- `DrawOP_COPY_Compress_16` (el camino genérico, headers fuera de `[-7,-3]`): la única variante que
+  `loader/sprite_decode.c` reproducía — confirmado fiel, sin distinción de bit 14, un byte de paleta por
+  píxel.
+- `DrawOP_COPY_Compress_16_Ex` (`out_ghidra.c:198818`, headers -3/-6) y
+  `DrawOP_COPY_Compress_16_Ex_Alpha` (`out_ghidra.c:199071`, header -6 con un plano de alpha aparte)
+  **sí distinguen el bit 14 del token además del bit 15**: cuando el token completo es `>= 0xC000` (bits 15
+  Y 14 prendidos), es un **run repetido** — UN solo byte de paleta se repite N veces (`N = token & 0x3fff`),
+  y el puntero de origen solo avanza 1 byte en total — a diferencia de un run literal (`0x8000-0xBFFF`,
+  bit 14 apagado) donde sí se lee un byte nuevo por píxel (`N = token & 0x7fff`).
+
+`DrawOP_COPY_Compress_16_Vita` (Fase 44) no distinguía estos dos casos: interpretaba **cualquier** token con
+el bit 15 prendido como run literal (máscara `0x7fff` siempre). Un run repetido real como `0xC005`
+(repetir 5 veces) se leía entonces como un run literal de `0xC005 & 0x7fff = 0x4005` (**16389** píxeles) —
+una lectura/escritura miles de veces más grande que el sprite real, corrompiendo memoria del heap adyacente
+sin causar un crash inmediato. Los efectos/partículas (`CGxPZxEffectExFrame`) son candidatos naturales para
+usar el run repetido con frecuencia (bloques grandes de color sólido para brillos/destellos), lo que explica
+por qué el crash se manifestó ahí — varios frames después del sprite que realmente disparó la corrupción,
+el mismo patrón de "corrupción silenciosa que se manifiesta en código no relacionado" ya visto en la Fase 38.
+
+**Fix aplicado, en `loader/sprite_decode.c`** — no se intentó reproducir las 3 variantes "Ex" (formato de
+bits más plano alpha, confianza menor que el camino genérico ya verificado byte a byte): en vez de eso,
+`DrawOP_COPY_Compress_16_Vita` ahora lee el header ANTES de decodificar nada, y si cae en `[-7,-3]`
+**delega al puntero original real** (`g_orig_copy_func`, capturado en `SetZeroBlendFunc_hook` antes de
+reemplazarlo — el mismo patrón defensivo de "guardar el original antes de sustituir" que ya usan los demás
+hooks del proyecto). La rutina nativa solo se ejecuta para el camino genérico ya confirmado fiel — mismo
+criterio que `PutCompressImgGuard` (Fase 32): no adivinar en los casos sin confirmar, delegar al código real.
+
+**Verificado en esta sesión**: recompilado `--sprite-decode-test`, limpio, sin warnings nuevos. Confirmado
+con `nm`/`strings` sobre el ELF real que `g_orig_copy_func` existe como símbolo real y que el log
+`[SpriteDecodeOptimize] Reemplazado COPY (0) con rutina C Vita nativa (orig=%p)` (actualizado para imprimir
+el puntero original capturado) está presente. **Pendiente confirmar en consola** que el crash no se repite
+con este fix — dado que la causa (run repetido mal interpretado) es un patrón de datos específico, no algo
+que dispare en cada sprite, puede hacer falta la misma escena (menú/carga con efectos) para confirmar.
+
+## Fase 46: entorno de build en WSL desde cero + 4 builds de prueba nuevos a pedido del usuario, tras
+## confirmar en el código decompilado que el downsample "misma vista, menos píxeles" está bloqueado por la
+## arquitectura del motor (2026-07-19)
+
+**Contexto / análisis (decompiled).** El usuario pidió atacar la velocidad reduciendo píxeles como hacía el
+zoom pero sin distorsión. Dos agentes sobre `out_ghidra.c` + la capa jadx confirmaron por qué es imposible
+nativamente: en Android `gameScreen = metrics.widthPixels` (resolución física; RPG 2D con FOV adaptativo,
+`NexusGLActivity.java:235`); `NativeInitWithBufferSize` → `initPlatformSize(w,h,w,h,h)` **fusiona** buffer y
+device; el blitter toma el stride de un struct global (`GcxGetMainScreenBuffer`) y las **posiciones de sprite
+son píxeles absolutos con la cámara ya aplicada aguas arriba** (sin transform en el blit); **no hay
+zoom/escala mundo→pantalla** (grep: solo `DrawSpriteZoom`/`Script_Screen_Zoom`, efectos, no un multiplicador
+global). Conclusión: resolución y FOV son la misma variable → cualquier buffer más chico zoomea. El único
+camino que ataca el cuello real (ancho de banda de escritura del render por software, confirmado por el cero
+de FPS del decode NEON de la Fase 44) es mover los sprites a la GPU.
+
+**Entorno de build (esta máquina WSL no tenía nada).** Instalado sin sudo: `cmake` 3.30.5 (binario prebuilt
+en `$HOME/tools`), VitaSDK toolchain (gcc 15.2.0, vía descarga manual del tarball de vdpm saltando su
+`sudo mkdir`), y todos los paquetes vdpm (`install-all.sh`: vitaGL/vitashark/mathneon/vorbisidec/ogg).
+`vita-parse-core` + `pyelftools` clonados en `$HOME` para triage (`PYTHONPATH=$HOME/tools/pyelftools`).
+`build.sh` adaptado a Linux (`sysctl`→`nproc`, `$HOME/tools` en PATH, `rm CMakeCache.txt` antes de configurar
+para que los flags nuevos no queden pegados). Fixes de toolchain para gcc 15 (no son bugs de código):
+`CMakeLists.txt` baja a warning `incompatible-pointer-types`/`int-conversion`/`implicit-function-declaration`/
+`return-mismatch`/`implicit-int` (promovidos a error desde gcc 14); y la vitaGL de vdpm ahora es C++
+(std::string/new/delete/excepciones) → se linkea `stdc++`/`supc++` con `-Wl,--allow-multiple-definition`
+(los 3 stubs `__cxa_*` no-op que `dynlib.c` define para el .so Android chocaban con libstdc++). Baseline
+recompilado limpio de punta a punta antes de tocar variantes.
+
+**4 builds de prueba (cada uno su propio VPK, mismo TITLEID PSVZ00004 → instalar/probar de a uno):**
+
+1. `./build.sh --skip-blit-test` → `zenonia_4_skip_blit_test.vpk`. **Techo de FPS**: `PutCompressImg` no-op
+   (`SKIP_SPRITE_BLIT`, `loader/dynlib.c`). Los sprites NO se dibujan; mide el máximo teórico si el blit por
+   software se eliminara. **Este es el que hay que medir PRIMERO**: si el FPS salta a 30-60 el blit es el
+   cuello y la Variante 2 vale la pena; si sigue en ~10 el cuello está en otro lado. No es jugable.
+2. `./build.sh --gpu-quads-test` → `zenonia_4_gpu_quads_test.vpk`. **Offload de sprites COPY a quads GPU**
+   (`GPU_QUADS`, `loader/gpu_quads.c` nuevo). Decodifica cada sprite UNA vez reusando el decoder real del
+   motor (fb alternativo en `param_9` offset 0x10; `w=p3`,`h=p4`; op COPY no clippea), lo cachea como textura
+   RGBA (color-key magenta→alpha) y dibuja quads con vitaGL tras `NativeRender`. EXPERIMENTAL: compositing
+   híbrido (fondo/UI/texto del sw-framebuffer abajo, sprites GPU encima → posibles problemas de capa) y
+   varios supuestos del motor sin verificar en hardware. Es la de mayor riesgo de crash/basura.
+3. `./build.sh --downsample-test [num den]` → `zenonia_4_downsample_test.vpk`. **Resolución interna reducida**
+   (`DOWNSAMPLE_RENDER`, default 2/3 = 640x362) + upscale bilinear por GPU. **AVISA en su propio comentario que
+   ESTO ZOOMEA** (el motor fusiona FOV y resolución, ver arriba) — reproduce a ratio suave lo que el usuario
+   ya vio; lo nuevo es el suavizado por GPU y el ratio ajustable (`--downsample-test 3 4` = zoom más leve).
+   Ahorro de CPU ~(1-(num/den)^2).
+4. `./build.sh --primitives-opt-test` → `zenonia_4_primitives_opt_test.vpk`. Combina las 2 optimizaciones
+   YA verificadas-seguras: `FASTCLEAR_NEON_OPTIMIZE` (Fase 41) + `NEON_LIBC_INTERCEPT` (#4). Las ~13
+   primitivas restantes de `CGsGraphics` pasan por `RGBBlend16` (alpha per-pixel sin confirmar) y no se pueden
+   reimplementar sin riesgo hasta medir cuál domina (`--cgsgraphics-probe`) y reversear ese path.
+
+Los 5 VPK (baseline + 4) compilan y linkean limpios, con md5 distintos (los defines cambian el binario).
+**Todo pendiente de medir en consola real** — ninguno se promueve a default. Orden de medición sugerido:
+#1 (techo) decide si #2 (GPU) vale la pena; #3 y #4 son medidas independientes de tradeoff.
+
+## Fase 47: resultados de consola real de los 4 builds de la Fase 46 (2026-07-19)
+
+Medido por el usuario (5 logs, `log_1784500696..995.txt`), baseline de referencia ~9-11 FPS:
+
+| Build | Init | FPS medido | Visual |
+|---|---|---|---|
+| **skip-blit** (techo) | 960x544 | **15.5 → 24.4** | pantalla negra |
+| **gpu-quads** | 960x544 | **12.6 → 13.5** (usuario vio hasta 15) | sprites CON errores gráficos, SIN controles ni efectos |
+| **downsample** | 640x362 (define OK) | 11.5 | sin cambio visible (ni zoom ni FPS) |
+| **primitives-opt** | 960x544 | 10.5 | pantalla negra |
+
+**Lecturas:**
+- **TECHO = ~24 FPS (2.4x)**. Sacar el blit de sprites (`PutCompressImg` no-op) sube el FPS a 24 y deja la
+  pantalla NEGRA -> confirma que (a) el blit por software ES el cuello dominante, y (b) casi TODO lo visible
+  (fondo + sprites) pasa por `PutCompressImg`. El offload a GPU es el camino correcto y hay margen 2.4x.
+- **gpu-quads FUNCIONA: +30-50% de FPS real (13-15) y renderiza**, capturando ~40% del techo. Dos problemas,
+  ambos entendidos: (1) errores gráficos -- NO es orden de canales (mi `rgb565_to_rgba8888` ya coincide con
+  el `convert_rgb565_to_rgba8888` probado del loader); candidatos: color-key magenta con falsos positivos,
+  z-order entre quads, o cache stale si el motor reusa un puntero de datos. (2) sin controles/efectos: es un
+  problema de CAPA -- el framebuffer base (que ahora tiene SOLO los draws no-COPY = efectos + UI de
+  CGsGraphics, porque los COPY se saltaron) se dibuja PRIMERO, y los quads de tiles/sprites opacos lo TAPAN.
+- **downsample = callejón sin salida CONFIRMADO empíricamente**: el buffer sí se creó a 640x362 pero no dio
+  ni FPS ni cambio visual. Descartar.
+- **primitives-opt = negro + sin FPS**: `FastClearNonClipping` reimplementado y/o NEON-libc rompen el render
+  al combinarse (o bajo gcc 15). Sin ganancia esperada de todos modos (el cuello son los sprites, no las
+  primitivas). Descartar.
+
+**Conclusión**: enfocar TODO en gpu-quads. El siguiente paso es un compositor por CAPAS correcto (dibujar los
+quads de sprites/tiles en orden de llamada, y la base con efectos+UI ENCIMA con el color de clear como
+color-key transparente) para recuperar efectos/controles, y depurar los errores gráficos. downsample y
+primitives quedan descartados con datos.
+
+## Fase 48: bug real encontrado en `PutCompressImg_hook` (GPU_QUADS) -- forzaba op=0 para CUALQUIER
+## enumDrawOP, contradiciendo el propio branching por op de `gpu_quads_finish_decode` (2026-07-19)
+
+Usuario reportó (`log_1784509649.txt`, ~21:07, mismo build `--gpu-quads-test` que la Fase 47, sesión
+posterior) colores magenta, cajas negras verticales/horizontales, texto que no aparece y transparencias
+rotas -- "casi no se puede jugar". El log en sí no tiene `FATAL` ni crash; es el mismo patrón ya anotado en
+la Fase 47 ("sprites CON errores gráficos, SIN controles ni efectos"), ahora descrito con más detalle visual.
+
+**Bug real confirmado leyendo `loader/dynlib.c` (`PutCompressImg_hook`)**: el desvío a GPU_QUADS interceptaba
+**cualquier** `enumDrawOP` (el parámetro `op` de la llamada real, no filtrado antes de la Fase 48) y forzaba
+`op=0` (COPY puro) en la llamada real al motor hacia el scratch, con el comentario "para que no haga blending
+por software". Pero `gpu_quads_finish_decode()` (`loader/gpu_quads.c`) sí distingue por el `op` ORIGINAL al
+extraer el scratch: `op==1` asume ARGB4444 (UI/texto), el resto asume RGB565 (Copy/Add). Contradicción directa:
+para cualquier sprite con `op` distinto de 0 (texto, UI, additive), el scratch **nunca** contenía realmente el
+formato que se asumía al extraer -- el decode se corrió siempre con el blitter de COPY/RGB565 paletizado,
+interpretando un stream de formato probablemente distinto (ARGB4444 sin paleta, u otro layout no confirmado)
+con el parser equivocado. Consecuencias esperadas de esa clase de bug, consistentes con el reporte del
+usuario: colores inválidos/magenta (candidato adicional al color-key en sí) y esos sprites (texto/UI/efectos)
+nunca llegan al framebuffer real -- ni por software (se desvían acá) ni correctos por GPU -- explicando
+"los textos no aparecen" y reforzando el hallazgo ya anotado en la Fase 47 ("sin controles ni efectos").
+
+**Fix aplicado** (`loader/dynlib.c`, `PutCompressImg_hook`): la desviación a GPU_QUADS ahora solo aplica si
+`op == 0` -- el único caso confirmado end-to-end (comentario original de `gpu_quads.h`: COPY no clippea y su
+formato de scratch coincide con lo que se extrae). Cualquier otro `op` (texto/UI/additive/etc.) cae al camino
+de software normal sin desviar, hasta confirmar el formato real de cada `enumDrawOP` contra `out_ghidra.c`.
+Recompilado `--gpu-quads-test` limpio (mismos warnings preexistentes de `strncpy`, sin warnings nuevos).
+
+**Sobre las cajas negras y el orden de capas**: releyendo el código real de `glDrawArrays_wrapper`, el orden
+es `gpu_quads_flush()` (dibuja los quads de sprites) **antes** del `glDrawArrays` real que dibuja el
+framebuffer base -- es decir, la base queda ENCIMA de los quads, no al revés de como lo resumió la Fase 47.
+Como la base es una textura `GL_RGB` (sin canal alfa, confirmado por `RGB565_DIRECT_UPLOAD` subiendo el
+formato tal cual), su alfa muestreado es 1.0 en todo punto, así que en teoría taparía completamente cualquier
+quad debajo -- pero el usuario SÍ ve sprites (con errores), no una pantalla lisa de base, así que esta lectura
+del orden todavía no está 100% conciliada con lo observado en consola real; no se afirma una conclusión aquí,
+solo se deja documentada la discrepancia para revisar CON el fix de la Fase 48 ya puesto (que por sí solo
+podría cambiar bastante lo que se ve, al sacar texto/UI/efectos del camino roto).
+
+**Pendiente para la próxima sesión**: instalar el `--gpu-quads-test` recompilado (build/zenonia_4_gpu_quads_test.vpk)
+en consola real y confirmar si (a) el magenta/cajas negras se redujeron, (b) el texto/UI/efectos volvieron a
+aparecer, y (c) si persiste algún problema de capas (sprites tapados por la base), abordar el compositor por
+capas correcto ya identificado en la Fase 47 como siguiente paso.
+
+## Fase 49: causa raiz de los errores graficos de GPU_QUADS (magenta, textos invisibles, cuadriculado) --
+## flush pisaba el estado GL del motor + compositing con color-key compilado fuera + glColor4x mapeado mal (2026-07-19)
+
+Reporte del usuario (build `--gpu-quads-test` con el fix de la Fase 48, logs `log_1784510364/510991.txt`,
+~21:20-21:30): sprites/efectos no aparecen, capa magenta donde deberia haber transparencia, colores
+invertidos en el logo de Gamevil, efecto magenta en la animacion del title/menu/pausa, textos de las
+fuentes originales invisibles, y en gameplay un cuadriculado con lineas negras y magenta. El rendimiento
+si mejoro (fps=30.7 en menus, ~14 en gameplay con 286 calls/frame) y el audio funciona.
+
+**Cuatro causas raiz encontradas leyendo el codigo real contra los logs (no una sola):**
+
+1. **`gpu_quads_flush()` pisaba el estado GL del motor justo antes de su propio draw** (la causa dominante
+   de "textos/UI/efectos no aparecen"). El flush corria DENTRO de `glDrawArrays_wrapper`, DESPUES de que
+   las conversiones GL_FIXED setearan los punteros del draw real del motor, y dejaba: punteros de
+   vertices/texcoords apuntando a un array LOCAL del flush (colgante al retornar), la textura del ULTIMO
+   quad ligada (no la del FB base), `GL_VERTEX_ARRAY`/`GL_TEXTURE_COORD_ARRAY` deshabilitados, el blend
+   func cambiado y matrix mode en PROJECTION. El `glDrawArrays` real del motor (el que dibuja el FB base
+   con texto/UI/efectos) salia con ese estado roto -- por eso solo se veian los quads. Esto tambien
+   resuelve la discrepancia anotada al final de la Fase 48. **Fix**: sombra del estado del motor en los
+   wrappers de dynlib (`g_engine_*`: textura ligada, blend on/func, GL_TEXTURE_2D, client states, color,
+   matrix mode, punteros no-FIXED) + `gpu_quads_restore_engine_state()`; el flush se movio al INICIO de
+   `glDrawArrays_wrapper` (antes de las conversiones GL_FIXED, que re-aplican los punteros despues) y
+   devuelve cuantos quads dibujo para restaurar solo cuando toco algo.
+
+2. **El compositing "FB base encima con color-key" estaba compilado fuera en este build**. El diseño
+   necesita DOS piezas que el flag set real (`RGB565_DIRECT_UPLOAD=ON`, `FASTCLEAR_NEON_OPTIMIZE=OFF`)
+   excluia: (a) la subida del FB iba directa como `GL_RGB`/565 -> opaca en todo punto, sin el camino
+   `convert_rgb565_to_rgba8888` que mapea el color-key `0x0001` a alpha 0 (verificado en el log: format=1907
+   type=8363, y ni una linea de `convert_rgb565_to_rgba8888` ni `[FastClearOptimize]`); y (b) el relleno
+   del FB con `0x0001` vivia dentro del hook de FastClear, no instalado. **Fix**: en builds GPU_QUADS los
+   uploads 565 SIEMPRE pasan por la conversion con color-key (aunque `RGB565_DIRECT` este ON), el draw de
+   la textura del FB (detectada por sus subidas 565 via el nuevo wrapper de `glBindTexture`) fuerza
+   GL_BLEND estandar solo para ese draw (restaurando despues el blend del motor), y tras consumir cada
+   frame el wrapper de `glTexSubImage2D` rellena el buffer VIVO del FB del motor con `0x0001` -- los op==0
+   desviados ya no pisan esas zonas por software, asi que sin relleno quedarian pixeles viejos acumulados.
+   Queda un diagnostico (`[GpuQuads] FB upload #N: X% pixeles color-key`) cada 300 frames: si diera ~0%
+   siempre, el motor esta limpiando el FB por su cuenta a otro valor y habria que interceptar SU clear.
+
+3. **El color-key magenta `0xF81F` del scratch era el origen del "efecto magenta"**, por dos vias: los
+   decoders "Ex" del motor con canal alfa (`DrawOP_COPY_Compress_16_Ex_Alpha`, headers [-7,-3] -- los
+   mismos del crash de la Fase 44) BLENDEAN por-pixel contra el dest, o sea contra el fondo magenta del
+   scratch -> bordes/pixeles semitransparentes teñidos de magenta que ya no coinciden con el color-key
+   exacto (logo con colores "invertidos", title/menu/pausa con velo magenta, lineas magenta en los bordes
+   de tiles = el cuadriculado); y ademas cualquier pixel magenta legitimo del arte se volvia transparente.
+   **Fix**: `GPU_QUADS_CKEY` pasa de `0xF81F` a `0x0001` (casi negro; el blend Ex_Alpha contra el da
+   practicamente lo mismo que el juego real sobre fondo negro), unificado con el color-key del FB base.
+
+4. **Bug real independiente en la tabla de simbolos**: `glColor4x` estaba mapeado a `glClearColorx_wrapper`
+   ("using same logic as glClearColorx for now"), que llama a `glClearColor` -- cada vez que el motor
+   seteaba color/alpha de vertice en punto fijo (fades de logo, tintes) cambiaba el CLEAR color y el color
+   de vertice quedaba intacto. **Fix**: `glColor4x_wrapper` real (Q16.16 -> `glColor4f`), y `glColor4f`
+   tambien pasa por wrapper para trackear el color en la sombra.
+
+Recompilado `--gpu-quads-test` limpio (`build/zenonia_4_gpu_quads_test.vpk`). **Pendiente de probar en
+consola**: (a) texto/UI/efectos de vuelta (causa 1), (b) magenta eliminado (causa 3), (c) mirar el
+diagnostico de % color-key del FB -- si es ~0% constante, el siguiente paso es interceptar el clear del
+motor para que limpie a `0x0001`; si los quads se ven tapados por zonas negras del FB, mismo sospechoso.
+Riesgo conocido y aceptado del relleno post-upload: si el motor NO redibuja algo cada frame (UI estatica
+que confia en la persistencia del FB), esa UI parpadearia/desapareceria -- el mismo diagnostico lo
+delataria (y el skip-blit de la Fase 47, pantalla negra total, sugiere que el motor si redibuja todo).
+
+## Fase 50: rediseno del compositor GPU_QUADS -- capas invertidas (FB debajo, quads encima en orden de
+## llamada) + decode dual negro/blanco con alpha premultiplicado; desviacion de TODOS los enumDrawOP (2026-07-19)
+
+Resultado en consola de la Fase 49 (usuario, `log_1784517442.txt`): title/menu sin magenta pero OSCUROS,
+splash de Gamevil sigue "invertido", regresion FUERTE de FPS (9.2 vs 30 en menus), fuentes danadas,
+cuadriculado negro/naranja en el terreno, sin elementos touch. El log revelo el mecanismo exacto de cada
+sintoma y que el diseno "FB base encima con color-key" de la Fase 49 es estructuralmente insuficiente:
+
+- **Oscuro/"invertido"**: el motor dibuja el quad del FB modulado por un COLOR ARRAY UByte cuyo valor en
+  los frames tempranos es `(168,26,16,129)` (alpha ~50%). Con el blending que la Fase 49 forzaba para el
+  color-key, ese alpha 129 paso a aplicarse de verdad -> toda la pantalla al ~50% sobre el clear negro
+  (title/menu oscuros), y el splash blanco tenido de rojo oscuro translucido sobre el quad del logo = el
+  look "invertido". En los builds previos ese alpha nunca se aplicaba (blend apagado en ese draw).
+- **FPS 9.2**: la conversion NEON RGB565->RGBA8888 del FB completo por frame (el cuello historico de las
+  Fases 13/21) volvio al forzar el camino de conversion para el color-key.
+- **Cuadriculado negro/naranja + sin touch**: sombras (op3, p8=180), efectos colorize (op12, p8=0xF800
+  rojo) y overlays de UI se dibujan por software en el FB, que iba ENCIMA de TODOS los quads, blendeando
+  contra el relleno 0x0001 (negro) -> cajas opacas negras/rojizas en grilla sobre el terreno, e iconos
+  touch (quads, debajo) tapados por sus propios fondos (FB, encima). Es un limite ESTRUCTURAL del split en
+  dos capas: el orden real de dibujado del motor interlava ops de software y quads.
+
+**Rediseno (Fase 50), implementado:**
+
+1. **Capas invertidas**: el FB base vuelve a subirse DIRECTO en RGB565 (rapido, sin conversion, sin fill,
+   sin blending forzado -- se revirtio todo eso de la Fase 49) y se dibuja OPACO DEBAJO como siempre. Los
+   quads se dibujan ENCIMA, en `glDrawArrays_wrapper` JUSTO DESPUES del draw real del motor, preservando
+   entre ellos el orden de llamada original del motor.
+2. **Desviacion de TODOS los enumDrawOP** (no solo op==0) cuando `p9==0` (destino pantalla principal):
+   con todo desviado, el FB solo queda con primitivas CGsGraphics (fondos/fills, ~0/frame en gameplay) --
+   la capa de fondo legitima -- y el orden sprite-vs-sprite queda correcto por construccion. El decode usa
+   el blitter REAL del motor con el op REAL (nada de adivinar formatos por op, leccion de la Fase 48).
+3. **Decode dual + alpha premultiplicado (la pieza matematica clave)**: cada sprite se decodifica DOS
+   veces sobre scratch negro (d0) y blanco (d1). Cualquier operador afin en dest
+   (`result = c + (1-a)*dest`: copy, skip, blend, multiply/sombra, colorize) queda EXACTO: `c = d0`,
+   `a = 255-(d1-d0)`. La textura guarda `rgb = c` premultiplicado y `alpha = a`, y TODOS los quads se
+   dibujan con un unico `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)` -- sin divisiones, sin color-key
+   (y sus falsos positivos), sin per-op switching. op==2 (additive, no-afin por el clamp) usa una sola
+   pasada sobre negro con alpha=0: el mismo blend func da `src + dest` exacto.
+4. **Cache por (data,pal,op,p8)**: el blitter real hornea el efecto de p8 (color de colorize, alpha
+   global) en el decode, asi que (op,p8) son parte de la clave. Un fade via p8 re-decodifica por paso --
+   aceptable (decodes son ~0.2/frame en regimen).
+5. El sistema de fuentes (GFA/`CGxFACharCache`, `loader/font.c` + `java.c`) entrega glifos al motor y el
+   motor los blitea el mismo -> pasan por PutCompressImg y quedan cubiertos por la desviacion total.
+
+**Limitaciones conocidas y aceptadas de esta iteracion** (documentadas para triage del proximo log):
+sprites parcialmente fuera de pantalla caen al camino de software (quedan en el FB, debajo de los quads --
+inocuo para tiles que no se solapan, artefacto menor en bordes); primitivas CGsGraphics dibujadas DESPUES
+de sprites (flashes/fades de pantalla completa) quedarian debajo de los quads (fades parciales); posible
+crecimiento de VRAM con 4096 texturas cacheadas + churn de fades; op==2 asumido additive (confirmado
+Fase 46); la animacion de paleta (mismo puntero pal, contenido mutado) seguiria mostrando textura vieja.
+
+Se mantienen de la Fase 49: la sombra/restauracion de estado GL (ahora tras el flush post-draw), el fix
+real de `glColor4x` (iba a `glClearColorx_wrapper`), el wrapper de `glBindTexture` y el color-key 0x0001
+de `convert_rgb565_to_rgba8888` (inactivo bajo RGB565_DIRECT). Recompilado `--gpu-quads-test` limpio
+(`build/zenonia_4_gpu_quads_test.vpk`). **Esperado**: FPS de vuelta a >=14 (sin conversion por CPU y con
+MENOS blits de software que la Fase 47, deberia acercarse al techo de 24), splash/title/menu con brillo
+normal, fuentes y touch de vuelta, sin cuadriculado. Pendiente de medir en consola real.
+
+## Fase 51: fix confirmado del tinte oscuro (splash/menus) + diagnosticos para mapa/casas/bordes
+## faltantes y fuentes que "se saltan" (2026-07-20)
+
+Reporte del usuario tras la Fase 50 (`log_1784519090.txt`): FPS recuperado (11-21, sin la regresion de
+la Fase 49) y "ya no tengo errores graficos importantes" -- pero persisten 3 cosas: (1) splash de Gamevil
+sigue oscuro/"invertido" cuando deberia verse blanco, mismo para title/menu oscuros; (2) falta el sprite
+del mapa y algunos pedazos de casas/bordes del mundo; (3) texto con fuentes (tips, mensaje de guardar)
+"se saltan".
+
+**(1) CONFIRMADO y arreglado.** El log muestra el motor dibujando el blit de pantalla como un quad
+(`glTexCoordPointer`/`glVertexPointer`/`glColorPointer`/`glDrawArrays`) con un **color array RGBA por
+vertice** (`glColorPointer` tipo UByte, valor `(168,26,16,129)` -- alpha ~50%, capturado identico en
+las primeras ~10 llamadas) pero **`GL_BLEND` nunca se activa en TODO el log** (0 apariciones de
+`cap=be2`, solo `cap=de1`=TEXTURE_2D y una vez `cap=bd0`=DITHER). Sin blending, el alpha se ignora
+(GL_MODULATE puro: `resultado = textura_blanca * color_vertice = (168,26,16)` opaco) -- un tinte oscuro
+fijo reemplaza lo que deberia verse blanco/translucido. Esto explica tambien por que el mismo sintoma
+("colores invertidos en el logo") aparecio en TODOS los intentos anteriores (Fase 47/48/49): no es un bug
+de GPU_QUADS en si, es un estado de blend que el motor nunca activa para este tipo de draw (posiblemente
+porque en Android GLES este draw depende de un estado de blend dejado por una llamada anterior que
+nuestra tabla de simbolos no reproduce fielmente, o el motor asume blend ya activo desde su init).
+**Fix** (`dynlib.c`, `glDrawArrays_wrapper`, aplica a CUALQUIER build, no solo GPU_QUADS): si hay un
+color array RGBA activo (`g_engine_cs_color`) y blend esta apagado, forzar blend estandar
+(`GL_SRC_ALPHA`, `GL_ONE_MINUS_SRC_ALPHA`) SOLO para ese draw puntual y restaurar el estado exacto de
+antes inmediatamente despues. Matematicamente un no-op cuando alpha=255 (opaco): `src*1 + dst*0 = src`,
+identico a sin blending -- por lo que es seguro para cualquier otro draw con color array que no dependa
+de la traslucidez (no hay forma de que esto rompa algo que ya funcionaba).
+
+**(2) y (3): instrumentado, no arreglado a ciegas.** No hay evidencia suficiente en el log para identificar
+la causa exacta sin arriesgar otro ciclo de "adivinar y esperar" -- el sistema de fuentes GFA
+(`loader/font.c`, stb_truetype) es una reimplementacion JNI-side completamente AJENA a PutCompressImg (no
+pasa por gpu_quads en absoluto), asi que el sintoma de texto no puede depender de la logica de sprites;
+mas probable candidato compartido con (1): si el "char cache" del motor (`CopyPixelsToCharCacheBuffer`,
+comentario en `java.c`) dibuja los glifos cacheados con el MISMO patron de quad+color-array que el splash,
+el fix de (1) podria arreglarlo de rebote (a confirmar en el proximo log). Para el mapa/casas/bordes, dos
+candidatos sin confirmar: (a) elementos con coordenadas fuera del scratch de 960x544 (paneo de un widget
+mas ancho que la pantalla, ya visto en el log: `enumDrawOP=19 p1=1398` -- muy por encima de 960) que caen
+al camino de software (identico al baseline, no deberian faltar por eso) pero podrian depender de un
+enumDrawOP con semantica de TILING/9-slice que la desviacion "generica" (decode dual asumiendo un solo
+rectangulo w x h) no reproduce; (b) trashing de la cache de 4096 entradas, que con la Fase 50 (TODOS los
+enumDrawOP desviados, clave de cache ahora `(data,pal,op,p8)`) puede llenarse mucho mas rapido que antes
+si esos elementos usan muchas variantes de `p8` (pasos de fade/colorize) sobre el mismo sprite base.
+Se agregaron 2 diagnosticos (capados a 40 lineas cada uno, sin costo en regimen):
+- `[GpuQuadsDiag] fallback a software: op=... p1=... p8=...` en `PutCompressImg_hook` cada vez que
+  `gpu_quads_begin_pass` rechaza un sprite (fuera del scratch o > 1024x1024) -- si estas lineas
+  correlacionan con los elementos reportados como faltantes, apunta a (a).
+- `[GpuQuadsDiag] cache llena (4096 entradas) -- desalojando en anillo` en `gpu_quads.c` cada vez que la
+  cache se llena -- si aparece repetidamente en regimen (no solo una vez al cargar), apunta a (b).
+
+Recompilado `--gpu-quads-test` limpio (`build/zenonia_4_gpu_quads_test.vpk`). **Pendiente**: probar en
+consola y mandar el log -- (1) deberia verse resuelto (splash/title/menu con brillo normal); para (2) y
+(3) el proximo log dira si correlacionan con alguno de los 2 diagnosticos nuevos, lo que evita seguir
+adivinando a ciegas.
+
+## Fase 52: el fix de blend de la Fase 51 no alcanza (fondo negro persiste en splash Y title) --
+## correccion del razonamiento + diagnosticos de mayor alcance en vez de otro parche a ciegas (2026-07-20)
+
+Usuario confirma en consola real que el fondo sigue negro tanto en el splash de Gamevil como en el TITLE
+(antes solo se habia notado "oscuro"; ahora confirmado NEGRO en dos pantallas distintas). El fix de la
+Fase 51 (forzar blend estandar cuando hay color array activo) no resolvio nada.
+
+**Error de razonamiento detectado en la Fase 51**: `main.c` hace `glClearColor(0,0,0,1)` +
+`glClear(GL_COLOR_BUFFER_BIT)` ANTES de cada frame -- el destino de este draw es NEGRO en el momento en
+que se dibuja el quad tenido `(168,26,16,129)`. Blendear `src*alpha + dst*(1-alpha)` con `dst=(0,0,0)` da
+`(168,26,16)*0.505 ~= (85,13,8)` -- **mas oscuro todavia**, nunca blanco. El blending no puede recuperar
+blanco de un tinte que no es blanco; forzar blend ahi era matematicamente incapaz de arreglar este
+sintoma especifico (se deja el fix igual, es inofensivo y podria ayudar a ALGUN OTRO draw traslucido
+sobre un fondo mas claro, pero no es la causa de este bug).
+
+**Dato nuevo, mas fuerte, que cambia el diagnostico**: el mismo tinte negro/oscuro aparece en DOS
+pantallas de contenido completamente distinto (splash vs title) usando el MISMO mecanismo (el blit de
+pantalla completa con color array). Esto apunta a algo que se configura UNA SOLA VEZ al principio y afecta
+TODOS los frames por igual, no a datos por-escena. Candidato identificado en el log: las UNICAS 2 llamadas
+a `glTexEnvf` de TODO el run (`log_1784520216.txt`, justo al crear la textura del FB, antes del loop
+principal) usan `pname=GL_TEXTURE_ENV_MODE` con `param=480.0` y luego `param=0.0` -- **ninguno de los dos
+es un enum GL_TEXTURE_ENV_MODE valido** (MODULATE=8448, DECAL=8449, GL_BLEND=8450, REPLACE=7681, ADD=260,
+COMBINE=34192). GL real rechazaria un enum invalido (GL_INVALID_ENUM, sin cambiar el modo -> queda en
+MODULATE, el default). Si vitaGL en cambio ACEPTA el valor 0.0 sin validar, la textura del FB podria haber
+quedado en un modo de combine roto desde el arranque -- aplicado una sola vez, pero activo en TODOS los
+draws subsiguientes de esa textura, en cualquier pantalla.
+
+**Cambios (ambos instrumentacion + 1 guardia de bajo riesgo, `dynlib.c`):**
+1. `glTexEnvf_wrapper`: si `pname==GL_TEXTURE_ENV_MODE` y el `param` no es un enum de modo reconocido, la
+   llamada se IGNORA (no se reenvia a vitaGL) en vez de dejar que vitaGL reciba el valor invalido --
+   replica el comportamiento de GL real (enum invalido = no-op, modo previo intacto). Si esto no cambia
+   nada visualmente, descarta esta hipotesis limpiamente en el proximo log (se loguea cuando se ignora).
+2. `glColorPointer_wrapper`: nuevo diagnostico dedicado (deduplicado por valor, capado a 200 CAMBIOS de
+   color en vez de 200 llamadas -- practicamente gratis) que loguea CADA VEZ que un color array RGBA
+   (size=4, UByte) cambia de valor, con `ui_status`. El log viejo (`log_colors`, cap=20 LLAMADAS totales
+   del run completo) se agotaba en las primeras 2-3 llamadas y no alcanzaba para saber si este color
+   realmente varia con el tiempo (una animacion de fade legitima que tarda muchos frames) o si esta
+   CLAVADO en el mismo valor sin importar la pantalla (memoria stale/no inicializada en vez de un fade
+   real). Este nuevo log responde esa pregunta de forma concluyente en el proximo capture.
+
+Recompilado `--gpu-quads-test` limpio (`build/zenonia_4_gpu_quads_test.vpk`). **Pendiente**: probar en
+consola, llegar hasta el title screen, y mandar el log -- si el guard de texEnvf resuelve el negro, se
+confirma la hipotesis; si no, las lineas `[GpuQuadsDiag] color-array RGBA cambio a...` diran si el valor
+alguna vez se mueve hacia blanco (fade lento) o si esta genuinamente fijo (bug de datos, no de blend/texenv,
+habria que revisar mas a fondo de donde sale el puntero 0x83228fc8/0x83228f90 en el binario real).
+
+## Fase 53: causa raiz real y confirmada del fondo negro (y candidato fuerte para bordes/mapa/fuentes) --
+## el array de color del quad de presentacion nunca es blanco, en 500+ frames, en ninguna pantalla (2026-07-20)
+
+`log_1784520862.txt` con los diagnosticos de la Fase 52 activos. El guard de `glTexEnvf` (hipotesis de la
+Fase 52) SI disparo -- las 2 unicas llamadas del run fueron ignoradas (`param=480.0` y, esta vez,
+`param=276847211434184015872.0` -- un valor distinto al run anterior, consistente con leer un registro/
+stack sin inicializar, reforzando que esas 2 llamadas puntuales son irrelevantes/basura) -- pero **el
+fondo siguio igual**: descarta la hipotesis de `glTexEnvf`/modo de combine como causa.
+
+El diagnostico nuevo (`color-array RGBA cambio a...`, dedupe por valor) fue la pieza decisiva: en **mas de
+500 frames**, atravesando splash (`ui_status=-1`), una transicion (`19`) y el title/menu (`14`), el array
+de color del quad de presentacion (`glColorPointer` UByte, el que tiñe el blit del framebuffer completo)
+**cambio de valor UNA sola vez** (el valor inicial) y **nunca mas** -- es decir, es un valor constante,
+no una animacion de fade que eventualmente llega a blanco. Verificacion cruzada con
+`nm -D --undefined-only libgameDSO.so`: el `.so` real **NO importa `glColor4f`, `glColor4x`, `glBlendFunc`
+ni `glAlphaFunc`** -- el UNICO mecanismo de tinte de vertice en TODO el binario es este array de
+`glColorPointer`, y quedo probado que SIEMPRE trae `(168,26,16,129)`, nunca otro valor, en ninguna de las
+3 pantallas observadas. Esto tiñe (multiplica, GL_MODULATE) TODO lo que se presenta en pantalla --
+incluyendo bordes, texto cacheado y sprites de fondo ya renderizados con sus colores reales en el
+framebuffer de software -- con un factor oscuro constante. Elementos ya tenues (bordes del mundo, texto)
+pueden volverse practicamente invisibles contra un fondo ya oscurecido: **candidato unificador para los 4
+sintomas reportados** (fondo negro en splash/title, mapa/casas/bordes faltantes, texto que "se salta"),
+no 3-4 bugs independientes.
+
+**Fix** (`dynlib.c`, `glColorPointer_wrapper`): cuando el array es RGBA UByte (el unico tipo/uso
+observado en todo el run), se reemplaza por un buffer estatico propio de blanco opaco (`0xFFFFFFFF`
+repetido, 65536 vertices de margen) en vez de reenviar el array real del motor -- equivalente al color
+"current" default de GL, que este motor tampoco toca jamas (no importa `glColor4f`/`glColor4x`). Se
+elimino el forzado de blend de la Fase 51 (`glDrawArrays_wrapper`): su razonamiento era invalido (el
+destino ya es NEGRO en ese punto -- `glClearColor(0,0,0,1)` en `main.c` antes de cada frame -- blendear un
+tinte no-blanco contra negro nunca puede dar blanco) y con el array ya blanco queda sin efecto (alpha
+siempre 255). El guard de `glTexEnvf` (Fase 52) se mantiene como proteccion defensiva razonable (replica
+el comportamiento de GL real ante un enum invalido) aunque se descarto como causa de este bug.
+
+**Advertencia honesta**: esto es un workaround empirico validado por evidencia extensa (500+ frames, 3
+pantallas, un solo valor observado jamas), NO un fix de causa raiz identificada -- no se encontro de donde
+sale realmente `(168,26,16,129)` en el puntero rastreado (no hay JNI de color/fade/tint relacionado en
+`java.c`) ni por que nunca se actualiza. Si mas adelante (combate, dialogos, flashes de daño) aparece un
+uso LEGITIMO de este mismo mecanismo con otro valor, este fix lo blanquearia tambien -- sin evidencia de
+that en las +500 frames observadas hasta ahora (splash + transicion + title). Recompilado
+`--gpu-quads-test` limpio (`build/zenonia_4_gpu_quads_test.vpk`). **Pendiente**: probar en consola,
+llegar hasta gameplay real (no solo title) y confirmar si el fondo aparece blanco, si el mapa/bordes
+faltantes reaparecen (soportaria la teoria de "tenue + oscurecido = invisible") y si el texto se lee bien.
+Los diagnosticos `[GpuQuadsDiag] fallback a software: op=1 p1=... p8=...` de la Fase 51 ya mostraron un
+patron de TILING claro (un sprite 112x60 repetido en grilla en los bordes de un area, con muchas
+posiciones fuera del scratch de 960x544) consistente con bordes de ventana/mapa -- si tras este fix esos
+bordes siguen sin verse, ESE es el siguiente sospechoso a investigar (un enumDrawOP de tiling que la
+divergencia "generica" no reproduce), no el tinte.
+
+## Fase 54: decodificar sprites SIEMPRE en el origen (0,0) del scratch, desacoplado de su posicion en
+## pantalla -- fix real para "falta el sprite del mapa/casas/bordes del mundo" (2026-07-20)
+
+Aplicado directamente sobre `gpu_quads.c`/`gpu_quads.h` tras el diagnostico de la Fase 51
+(`[GpuQuadsDiag] fallback a software: op=1 p1=880/-32/1398 ...`), que mostro un patron de TILING claro
+(un sprite de 112x60 repetido en grilla en los bordes de un area mas ancha que la pantalla, con
+`p1` llegando a 1398 o bajando a -549) -- exactamente el tipo de elemento (bordes de ventana/mapa) que el
+usuario reporto faltante.
+
+**Causa real**: `gpu_quads_begin_pass`/`gpu_quads_finish_decode` (version Fase 50) escribian y leian el
+scratch en la posicion ABSOLUTA de pantalla (`x,y` = `p1,p2`), y el chequeo de limites exigia
+`x >= 0 && y >= 0 && x+w <= 960 && y+h <= 544`. Cualquier sprite cuya posicion en pantalla cayera aunque
+sea PARCIALMENTE fuera de ese rango (tiles de borde con la camara movida, un widget de mapa mas ancho que
+los 960px fisicos) fallaba el chequeo y caia al camino de software -- perdiendo el offload a GPU
+exactamente para los elementos de borde/mapa que MAS se benefician de estar "siempre visibles" en la
+composicion final. El sprite en si (112x60, 36x23, etc.) es chico y cabe perfecto en el scratch; el
+problema era exigir que TAMBIEN quepa en su posicion absoluta de pantalla.
+
+**Fix**: el scratch ahora se llena y se lee SIEMPRE desde `(0,0)` (`gpu_quads_begin_pass(w,h,fill)` /
+`gpu_quads_capture_pass1(w,h)` ya no reciben `x,y`), y el chequeo de limites pasa a ser solo
+`w <= GPU_QUADS_MAX_W/H` y `w <= GPU_QUADS_SCRATCH_W/H` -- la posicion en pantalla (`screen_x,screen_y`,
+los `p1,p2` originales) se usa UNICAMENTE al encolar el quad para dibujar (`gpu_quads_finish_decode`,
+`gq_quad.x/y`), nunca para decidir si el sprite entra en el scratch. `PutCompressImg_hook`
+(`dynlib.c`) ahora llama al blitter real con posicion `(0,0)` fija (en vez de `p1,p2`) para AMBAS pasadas
+del decode dual, y pasa `p1,p2` reales solo a `gpu_quads_finish_decode` para el encolado. Esto permite que
+sprites con coordenadas de pantalla arbitrarias (negativas, mayores a 960/544, o ambas) se decodifiquen y
+cacheen normalmente -- el fallback a software ahora solo ocurre si el sprite en si es mas grande que
+1024x1024 (gigante, caso realmente raro).
+
+## Fase 55: clave de cache con muestreo de contenido -- evita cache stale cuando el motor reusa el mismo
+## puntero de datos para contenido DISTINTO (candidato para texto/mapa que no se actualiza) (2026-07-20)
+
+Aplicado junto con la Fase 54. La cache de texturas (`g_cache`, Fase 50) indexaba solo por
+`(data, pal, op, p8)` -- el puntero a los datos comprimidos del sprite. Si el motor reutiliza el MISMO
+buffer de memoria para contenido diferente entre frames (patron comun para datos generados
+dinamicamente: un tile de mapa que se re-renderiza en un buffer scratch propio del motor, un glifo de
+texto compuesto en un buffer temporal, un frame de animacion del splash) en vez de asignar un puntero
+nuevo por cada imagen, la cache de la Fase 50 habria mostrado SIEMPRE la textura del PRIMER contenido
+visto en esa direccion, ignorando las actualizaciones reales -- consistente con "el sprite del mapa" o
+partes del splash quedando congeladas/desactualizadas en vez de "faltantes" en el sentido estricto.
+
+**Fix** (`gq_hash`, `gpu_quads.c`): ademas de `(data,pal,op,p8)`, el hash de cache ahora incorpora 3
+muestras de PIXELES reales del buffer de origen (`data[0]`, `data[mitad]`, `data[ultimo]`) cuando el
+puntero cae en un rango de heap dinamico (`>= 0x40000000`) -- si el contenido cambia entre llamadas con el
+mismo puntero, el hash cambia, `gq_find` no encuentra coincidencia, y se decodifica una textura NUEVA en
+vez de reusar la vieja por error. `gq_entry` ahora guarda su propio `hash` para la comparacion final en
+`gq_find` (ademas de punteros/op/p8), y tanto `gpu_quads_lookup_and_enqueue` como
+`gpu_quads_finish_decode` recalculan el hash con los mismos `(data,pal,op,p8,w,h)`.
+**Costo**: 3 lecturas de memoria extra por sprite en el hot path -- despreciable frente al decode dual
+completo que ya se hace en cache-miss.
+
+## Resumen de la sesion (Fases 47-55): de "gpu-quads mejora el FPS pero rompe todo visualmente" a un
+## compositor por capas funcional -- EL FIX MAS GRANDE fue el rediseno completo de la Fase 50
+
+El objetivo de la sesion fue diagnosticar y arreglar los errores graficos de la Variante 2 del port
+(`GPU_QUADS`, offload de sprites `PutCompressImg` a quads texturizados por GPU para subir el FPS, ver
+Fase 46), que el usuario reporto funcionando en FPS pero con "efectos/sprites que no aparecen, capa
+magenta donde deberia ser transparencia, colores invertidos, texto ilegible, cuadriculado negro/magenta en
+el gameplay". Se hicieron 9 iteraciones (Fase 47 a 55), cada una a partir de logs reales de consola:
+
+1. **Fase 48** -- primer bug real: el hook forzaba `op=0` (COPY) sin importar el `enumDrawOP` real de la
+   llamada interceptada, mientras el resto del codigo SI distinguia por `op` al extraer el resultado --
+   contradiccion que producia colores invalidos para cualquier sprite no-COPY. Fix: restringir la
+   desviacion a GPU solo a `op==0` hasta entender el resto.
+2. **Fase 49** -- con la desviacion mas conservadora, aparecieron el resto de los sintomas (magenta,
+   cajas negras, texto invisible) por 3 causas simultaneas: el color-key de transparencia era magenta
+   literal (colisionaba con magenta real del arte y con el blending de canal alfa del motor), el
+   compositing "FB encima con color-key" estaba compilado fuera del build real usado, y `glColor4x`
+   estaba mapeado por error a la logica de `glClearColorx` (cambiaba el color de fondo en vez del color de
+   vertice). Se armo por primera vez un sistema de "sombra" del estado GL del motor (textura ligada,
+   blend, client states, color, matrix mode) para poder restaurar lo que el flush de quads pisaba.
+3. **Fase 50 -- EL FIX MAS GRANDE DE LA SESION.** Con los datos de las Fases 47-49 ya entendidos, quedo
+   claro que el diseño de "FB encima con color-key" era estructuralmente incapaz de reproducir el orden
+   real de dibujado del motor (que intercala primitivas de software y sprites libremente) y ademas obligaba
+   a convertir el framebuffer completo por CPU cada frame (el cuello de rendimiento original que todo el
+   proyecto Variante 2 buscaba eliminar). Se rediseño el compositor de punta a punta:
+   - **Capas invertidas**: el framebuffer del motor vuelve a subirse DIRECTO en RGB565 (rapido, sin
+     conversion) y se dibuja OPACO DEBAJO; los sprites se dibujan ENCIMA, en el ORDEN DE LLAMADA original
+     del motor (preserva el z-order real sprite-contra-sprite).
+   - **TODOS los `enumDrawOP` se desvian a GPU** (no solo COPY): con todo desviado, el framebuffer de
+     software solo contiene las primitivas de fondo (`CGsGraphics`), asi que el orden entre sprites queda
+     correcto por construccion en vez de depender de adivinar que operaciones son "seguras".
+   - **Decodificacion dual + alfa premultiplicado** (la pieza matematica central): cada sprite se
+     decodifica DOS VECES con el blitter REAL del motor (mismo `op`, nada de adivinar formato por
+     operacion -- la leccion de la Fase 48) sobre un scratch negro y uno blanco. Para cualquier operador
+     afin en el destino (copy, skip, blend, sombra/multiply, colorize) esto da el alfa EXACTO por pixel
+     sin necesitar color-key: `color = resultado_sobre_negro`, `alpha = 255 - (resultado_sobre_blanco -
+     resultado_sobre_negro)`. La textura se guarda premultiplicada y TODOS los sprites (sin importar su
+     `op`) se dibujan con un unico `glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)` -- el color-key y sus
+     falsos positivos con el magenta real del arte desaparecen por completo, y el modo aditivo (dano,
+     particulas) sale exacto usando alfa 0 en una sola pasada.
+   - La cache de texturas paso a indexar por `(data,pal,op,p8)` en vez de solo `(data,pal)`, porque el
+     blitter real "hornea" el efecto de `p8` (color/alfa de colorize) en el resultado del decode.
+   
+   Este cambio -- no cualquiera de los parches puntuales -- fue el que saco al build de "renderiza con
+   errores graves" a "funciona con errores puntuales identificables": recupero sprites, efectos, UI y
+   controles tapados por el orden de capas invertido, elimino el color-key y sus falsos positivos, y quito
+   la conversion del framebuffer por CPU (recuperando el FPS que la Fase 49 habia hecho retroceder a
+   ~9 fps).
+4. **Fase 51-52** -- con el compositor ya solido, aparecieron sintomas mas finos y localizados: fondo
+   negro/oscuro en splash y title (se probo, sin exito, forzar blend -- descartado despues por
+   matematicamente invalido, ver Fase 53) y un enum invalido en 2 llamadas puntuales a `glTexEnvf`
+   (guardia defensiva agregada, luego confirmada irrelevante para este bug). Se agregaron diagnosticos de
+   bajo costo (fallback a software por limites, cache llena, cambios de color por-vertice) en vez de seguir
+   parchando a ciegas.
+5. **Fase 53** -- causa raiz real del fondo negro, confirmada con evidencia cruzada (`nm -D` del `.so`
+   real + 500 frames de instrumentacion): el `.so` NUNCA importa `glColor4f`/`glColor4x`/`glBlendFunc`/
+   `glAlphaFunc` -- el UNICO tinte de vertice de todo el binario es un array de color que, medido en 3
+   pantallas distintas (splash, transicion, title), SIEMPRE trae el mismo valor no-blanco. Fix: neutralizar
+   ese array a blanco opaco. Unifico 3 de los 4 sintomas originales bajo una sola causa (un tinte oscuro
+   constante multiplicando TODO lo que se presenta en pantalla explica el fondo negro Y por que elementos
+   tenues como bordes/texto se veian "faltantes").
+6. **Fase 54-55** -- con el fondo ya corregido, se cerraron los ultimos 2 huecos identificados por los
+   diagnosticos de la Fase 51: sprites con coordenadas de pantalla fuera de los limites del scratch (bordes
+   de mapa/ventana) ya no se excluyen del camino GPU (decodificar siempre en el origen del scratch,
+   desacoplado de la posicion en pantalla), y la clave de cache incorpora una muestra del contenido real
+   para no mostrar una textura vieja cuando el motor reusa el mismo puntero para datos distintos (texto/
+   mapa generados dinamicamente).
+
+**Estado actual**: compila limpio (`build/zenonia_4_gpu_quads_test.vpk`). Pendiente confirmar en consola
+que splash/title se ven con brillo correcto, que el mapa/casas/bordes ya no faltan, y que el texto se lee
+bien -- los diagnosticos de la Fase 51 (`[GpuQuadsDiag] fallback a software`, `cache llena`) siguen activos
+y de bajo costo por si aparece algun caso residual no cubierto por las Fases 54-55.
+
+### Fase 54 (2026-07-20): Fix del Clipping y Z-order en GPU Quads
+**Problema:** Los sprites de la interfaz (vida, bordes del mapa) y otros elementos caían al dibujado por software (CPU) en el `g_FB` (framebuffer base) porque sus coordenadas se salían de la pantalla original (clipping). Al estar en el framebuffer base, quedaban escondidos **debajo** de las capas de la GPU (el suelo, personajes, etc.), generando la ilusión de que faltaban sprites, y resultando en fondos negros o gráficos corruptos.
+**Solución:** 
+Se reestructuró el pipeline en `dynlib.c` y `gpu_quads.c` para que la decodificación (`PutCompressImg`) ocurra siempre en la coordenada `(0,0)` de manera interna en el buffer scratch, en lugar de hacerlo en la posición final de la pantalla `(screen_x, screen_y)`.
+Posteriormente, las coordenadas reales se delegan a `gpu_quads_enqueue_gl()`, permitiendo que sea la GPU nativa de la Vita (mediante OpenGL) quien aplique el recorte (clipping) final en la pantalla.
+**Resultados:** Se eliminó por completo el fallback a software por recortes. Los elementos UI ahora se aceleran en la GPU, respetando su nivel correcto (por encima del suelo y juego), solucionando los elementos de HUD y mapas "faltantes".
+
+### Fase 55 (2026-07-20): Invalidación de Caché para Búferes Dinámicos (Textos y Gamevil)
+**Problema:** Persistían tres errores visuales: la pantalla en el logo de Gamevil era completamente blanca, los textos nativos (fuentes, tips) estaban invisibles y las cajas de texto/minimapa tenían un fondo negro cuadrado y opaco.
+**Diagnóstico:** El sistema `gpu_quads` estaba asumiendo que **todos** los sprites (basados en su puntero `data`) eran assets estáticos en ROM. Sin embargo, elementos como el texto y mapas se renderizan en búferes dinámicos de memoria (*heap*), donde el puntero es siempre el mismo pero los píxeles cambian frame a frame (como un video o un atlas de fuentes re-escribible). Como resultado, la caché guardaba y fijaba para siempre el **primer** fotograma de estos búferes (por ej. un panel negro, un texto vacío o una pantalla de inicio en blanco).
+**Solución:** 
+Se extendió el sistema de hash de `gpu_quads.c` (`gq_hash` y `gq_find`). Ahora, si se detecta que el puntero proviene de memoria dinámica (`>= 0x40000000`), el motor lee *muestras específicas* (samples) del contenido real de los píxeles (inicio, medio y final de la textura). 
+Si el texto cambia o el logo hace fundido, los píxeles detectan la mutación y el hash cambia, obligando a generar una nueva textura al vuelo.
+**Resultados esperados (NO confirmados en consola con un log posterior a este fix -- ver Fase 56, esta
+sección sobre-afirmaba "Textos nativos visibles"/"transparencias correctas" como si ya estuvieran
+confirmados; corregido para no inducir a error a una sesión futura):**
+- Pantalla Gamevil blanca: se espera que se resuelva (detecta y cachea dinámicamente el fundido del logo).
+- Textos nativos: se espera que vuelvan a verse.
+- Transparencias de tips/minimapa: se espera que ya no tengan fondo negro.
+
+## Fase 56: nueva sesión reporta el mismo sintoma (texto/tips invisibles) -- el log adjunto resulto ser
+## el MISMO que motivo las Fases 53-55, capturado ANTES de esos fixes; bug real nuevo encontrado en
+## `gq_hash` por revision de codigo (2026-07-20)
+
+El usuario reporto en una sesion nueva: "textos dinamicos con fuentes no aparecen (tips, guardado,
+aceptacion, descripcion de objetos, opciones, ayuda)" y "los tips se skippean al cambiar de stage porque
+no hay nada que mostrar, no porque el juego cargue rapido" -- usando `zenonia_4_gpu_quads_test.vpk` y
+adjuntando `logs/log_1784522324.txt`.
+
+**Hallazgo 1 -- el log adjunto es ANTERIOR a los fixes de las Fases 53-55, no posterior:**
+comparando el timestamp del nombre del archivo (`1784522324` = 2026-07-20 00:38:44) contra el mtime de
+`loader/gpu_quads.c` (00:56:56) y el mtime del VPK ya compilado (`build/zenonia_4_gpu_quads_test.vpk`,
+01:00:00), este es EXACTAMENTE el mismo log cuyo contenido (patron de tiling `op=1 p1=880/-32 p3=112
+p4=60`, diagnostico de wordwrap `char_cnt=0 sub_len=11 maxWidth=0.00`) ya se usó para diagnosticar y
+corregir las Fases 53 (tinte oscuro global), 54 (decode en origen para sprites fuera de pantalla) y 55
+(hash de contenido para buffers dinamicos). El VPK actual en `build/` ya incluye esos 3 fixes, pero
+**no existe ningun log posterior a las 01:00:00 que confirme si el sintoma persiste con el build
+corregido** -- es la misma limitacion que ya dejaban explicita las Fases 53-55 ("pendiente confirmar en
+consola"), y la sesion anterior no llego a cerrar el ciclo antes de que el usuario reportara de nuevo el
+mismo sintoma en esta sesion. Sin un log nuevo no se puede saber si el sintoma reportado ahora es "el
+mismo bug, todavia no probado con el fix" o "el fix no alcanzo".
+
+**Hallazgo 2 -- bug real encontrado por revision de codigo (no por un log nuevo) en `gq_hash`
+(`loader/gpu_quads.c`, agregado en la Fase 55):** el sampling de contenido para buffers dinamicos
+indexaba `d[0]`, `d[(w*h)/2]`, `d[w*h-1]` tratando el puntero `data` (el `p5`/`uchar*` que recibe
+`PutCompressImg` de la Fase 50 -- el buffer FUENTE comprimido/paletizado para sprites `.pzx` normales, o
+el buffer crudo del char-cache de texto) como si fuera un array de pixeles de 16 bits con exactamente
+`w*h` elementos. Pero `w,h` son las dimensiones DECODIFICADAS de salida, no la longitud real del buffer
+fuente -- para un sprite comprimido tipico (la compresion RLE de este motor rinde mejor cuanto mas
+transparente es el sprite, confirmado en la Fase 43) el buffer real puede ser mucho mas chico que
+`w*h*2` bytes, asi que `d[w*h/2]`/`d[w*h-1]` leian bytes fuera de los limites del buffer real
+(comportamiento indefinido: memoria heap adyacente no relacionada, con riesgo de valores inconsistentes
+entre llamadas -- lo que podria producir hashes espurios y cache-misses/hits incorrectos -- o en el peor
+caso una lectura fuera del heap mapeado).
+
+**Fix aplicado** (sin esperar un log nuevo, es una correccion de un bug de memoria real detectado leyendo
+el codigo, no una hipotesis a ciegas sobre la causa del sintoma visual): el sampling ahora lee una
+ventana fija de los primeros 4 bytes del buffer (`d[0..3]`, `unsigned char`, no `uint16_t` indexado por
+`w*h`) en vez de offsets derivados de las dimensiones decodificadas -- siempre dentro de cualquier buffer
+no vacio, sin asumir su formato ni su longitud real. Sigue detectando mutacion de contenido para el caso
+que motivo la Fase 55 (texto/mapa/splash que reutiliza el mismo puntero con datos distintos): el inicio de
+un buffer comprimido casi siempre cambia si el contenido cambia (la codificacion RLE arranca desde la
+esquina superior-izquierda).
+
+**No resuelto, pendiente de log real**: no hay evidencia todavia de que este bug de `gq_hash` sea (total o
+parcialmente) la causa de "texto/tips invisibles" -- es un bug de memoria real encontrado por inspeccion,
+corregido porque es incorrecto independientemente del sintoma, pero el sintoma en si sigue sin una causa
+confirmada con datos de consola. **Proximo paso real**: recompilar `--gpu-quads-test`, instalar en
+consola, reproducir texto de tips/guardado/descripcion de items/opciones/ayuda y una transicion de stage,
+y mandar el log resultante (tendra timestamp posterior a este fix) -- eso va a decir si las Fases 53-55
+ya resolvieron el sintoma, si este fix de `gq_hash` cambia algo, o si la causa real esta en otro lado
+todavia sin identificar (candidatos sin descartar: el layout exacto del char-cache de
+`CGxFACharCache::CopyPixelsToCharCacheBuffer`, que empaqueta SOLO el canal alfa con un stride propio --
+confirmado en `out_ghidra.c:9673` -- y que el decode dual de `gpu_quads.c` nunca fue verificado
+especificamente contra ese formato de 8bpp-alfa-empaquetado en vez de RGB565/ARGB4444 de 16bpp).
+
+## Fase 57: build roto para TODOS los flags -- `-Wno-error=return-mismatch` no es una opcion valida de GCC
+## (2026-07-20)
+
+El usuario reporto que `build_and_install.sh` (recien mejorado con el menu de flags de la Fase 56) fallaba
+al compilar CUALQUIER variante (probado con `--gpu-quads-test`), con el mismo error en todos los `.c` del
+proyecto: `cc1: error: '-Wno-error=return-mismatch': no option '-Wreturn-mismatch'; did you mean
+'-Wargument-mismatch'?`.
+
+**Causa**: `CMakeLists.txt` (linea ~262) agrega `-Wno-error=return-mismatch` junto con otros 4 flags reales
+para bajar de ERROR a warning ciertos diagnosticos que GCC 14+ (el vitasdk-gcc actual, 15.2) promovio a
+error por defecto en C (`implicit-function-declaration`, `implicit-int`, `int-conversion`,
+`incompatible-pointer-types` -- necesarios para que el codigo vendorizado de `loader/so_util.c` etc.,
+escrito para un GCC mas viejo, siga compilando limpio). Pero **`return-mismatch` nunca fue un nombre de
+warning real en el front-end de C de GCC** -- el sugerido por el propio compilador (`-Wargument-mismatch`)
+es de Fortran, sin relacion. Este flag invalido rompe la compilacion de TODOS los `.c` del proyecto (no solo
+uno), consistente con el error identico repetido en cada archivo del log del usuario.
+
+**Por que no se detecto antes**: este flag estaba en el `CMakeLists.txt` desde antes de esta sesion (no lo
+agregue yo) -- probablemente nunca se hizo un build limpio desde que se configuro el toolchain de GCC 15.2
+en WSL (Fase 46, "entorno de build en WSL desde cero"), o un GCC ligeramente distinto en ese momento lo
+tragaba sin abortar (versiones de GCC varian en si un `-Wno-error=X` con `X` invalido es error duro o solo
+un warning ignorable). Cualquiera sea la razon, es un bug real preexistente en `CMakeLists.txt`, no algo
+introducido por el cambio a `build_and_install.sh`.
+
+**Fix**: se quito `-Wno-error=return-mismatch` de la lista -- los 4 flags restantes ya cubren los casos
+reales de GCC 14+ que motivaron la lista completa (los mismatches de tipo de retorno via puntero caen bajo
+`incompatible-pointer-types`). Documentado tambien como gotcha generico en
+`.claude/skills/psvita-porting/references/toolchain_gotchas.md` para que no se repita en otro port con un
+vitasdk-gcc moderno. **Pendiente**: el usuario tiene que volver a correr el build (`--gpu-quads-test` u
+otro) para confirmar que compila limpio con este fix.
+
+## Fase 58: primer build realmente limpio del `--gpu-quads-test` -- confirma logo/title arreglados, EL
+## FIX DE COLOR-ARRAY DE LA FASE 53 TENIA UN HUECO REAL, y aparece un bug arquitectonico mucho mas grande
+## para el texto (2026-07-20)
+
+`logs/log_1784586494.txt` (18:28, generado 5 minutos despues del primer build exitoso con el fix de la
+Fase 57 -- el primero que corre con TODAS las fuentes desde la Fase 46 realmente compiladas, dado que
+sospechamos que el bug de `-Wno-error=return-mismatch` pudo haber estado rompiendo builds silenciosamente
+desde antes). El usuario confirma: **el logo de Gamevil y el title ya NO aparecen en negro** -- resuelto,
+casi seguro por la combinacion de fixes de las Fases 50/53/54/55 llegando por primera vez a un binario que
+realmente compilo. Pero **el texto que no es sprite (tips, guardado, aceptacion, descripcion de items,
+opciones, ayuda) sigue sin aparecer** -- el mismo sintoma reportado al principio de esta sesion, ahora con
+evidencia real post-fix para investigar en serio.
+
+**Hallazgo 1 -- el fix de "blanqueo" del color-array de la Fase 53 tenia un match demasiado angosto.**
+`[GpuQuadsDiag] color-array RGBA cambio a (232,23,16,129)` en este log -- un valor DISTINTO al
+`(168,26,16,129)` observado en la Fase 52/53. `glColorPointer_wrapper` (`dynlib.c`) solo blanqueaba cuando
+el valor coincidia EXACTO con ese primer hardcode, asi que en esta corrida la rama de blanqueo nunca se
+disparo y el tinte oscuro seguia intacto para el blit de pantalla completa. Confirmado con `nm -D` (ya en la
+Fase 53) que el `.so` NUNCA importa `glColor4f/glColor4x/glBlendFunc/glAlphaFunc` -- no existe NINGUN
+mecanismo legitimo para que este array traiga un valor con sentido, y dos corridas distintas mostrando dos
+valores "sentinel" distintos confirma que es memoria sin inicializar, no un tinte real y estable. **Fix**:
+se quito la comparacion exacta -- ahora se blanquea CUALQUIER `glColorPointer(size=4, type=UBYTE)`, sin
+condicionar al valor. Aun con este fix, el logo/title ya se veian bien en este log (la explicacion mas
+probable es que simplemente NINGUN build anterior con los fixes de las Fases 50-55 habia llegado a
+compilar limpio hasta la Fase 57 -- ver ahi -- asi que "arreglar el build" fue en sí mismo el cambio que
+importo esta vez).
+
+## Fase 59: LA CAUSA REAL de "todos los textos que no son sprites no aparecen" -- el texto NUNCA pasa por
+## PutCompressImg, escribe DIRECTO al framebuffer de software, y GPU_QUADS compone ESE framebuffer
+## siempre DEBAJO de todos los sprites/paneles desviados a GPU (2026-07-20)
+
+El resumen de la Fase 50 asumia (sin verificar contra el `.so` real para este call site especifico) que
+"el sistema de fuentes GFA/CGxFACharCache entrega glifos al motor y el motor los blitea el mismo -> pasan
+por PutCompressImg". **Leyendo `out_ghidra.c` a fondo (no adivinando) esto es FALSO**: el camino real de
+render de texto es `CGxFACharCache::drawString` -> `DrawQueueChars` -> `DrawToFrameBuffer`
+(confirmado con `nm -D`: `_ZN14CGxFACharCache17DrawToFrameBufferEPN4gxfa12CharUnitInfoEii`,
+`out_ghidra.c:9872-10154`) -- una funcion que hace un blend alpha-sobre-RGB565 manual, pixel por pixel,
+escribiendo DIRECTO a un puntero de framebuffer que obtiene por una llamada virtual interna (NO
+`PutCompressImg`, NO pasa por nuestro hook de sprites en absoluto).
+
+**Por que esto explica el sintoma exacto reportado ("todos los textos que NO son sprites")**: la
+arquitectura GPU_QUADS de la Fase 50 compone el framebuffer de software COMPLETO como una unica capa base,
+SIEMPRE debajo de TODOS los quads de sprites del frame (`gpu_quads_flush()` se llama UNA sola vez, justo
+despues del unico `glDrawArrays` que presenta esa capa -- ver `gpu_quads.h`). El texto, al escribir directo
+a esa capa base, queda atrapado ahi -- cualquier sprite/panel de UI desviado a GPU_QUADS que el motor dibuje
+en la MISMA zona de pantalla (p.ej. el fondo de un cuadro de dialogo, un panel de opciones, el marco de un
+tip) se compone en el batch de quads que SIEMPRE va arriba de la capa base, sin importar que el motor haya
+llamado a `drawString` DESPUES (en tiempo real de ejecucion) de dibujar ese panel -- el orden real de
+llamadas del motor, que en el framebuffer unico original garantizaba que el texto quedara VISUALMENTE
+encima de su panel, se pierde por completo al partir el pipeline en "capa base" + "un solo batch de quads
+al final". Esto no es un bug de 3-4 casos puntuales -- aplica a CUALQUIER texto dibujado sobre CUALQUIER
+sprite/panel, exactamente "todo el texto que no es sprite", tal cual lo describio el usuario.
+
+**Fix (arquitectonico, no un parche puntual)**: se agrego un hook nuevo, paralelo al de `PutCompressImg`,
+sobre `CGxFACharCache::DrawToFrameBuffer` (`dynlib.c`, `DrawToFrameBuffer_hook`/
+`zenonia_install_text_quads_hook`, instalado junto con `zenonia_install_hotpath_probe` en `main.c`, solo
+bajo `ZENONIA_GPU_QUADS`). En vez de dejar que el original escriba al framebuffer de software, el hook:
+
+1. Lee el `CharUnitInfo` del glifo (confirmado en `out_ghidra.c`): `+8` = puntero a bytes de cobertura
+   0-255 (el char-cache SOLO guarda el canal alfa, ya documentado en `java.c`), `+0xc` = ancho (tambien el
+   stride del buffer, sin padding), `+0x10` = alto.
+2. Lee el color de texto actual, `this+0x48` -- confirmado que `CGxFACharCache::setColor565` NO guarda el
+   RGB565 crudo ahi, lo reempaqueta a componentes R5/G6/B5 pre-posicionados para el blend (los shifts
+   inversos exactos aparecen en `DrawToFrameBuffer`); se desempaqueta con la misma aritmetica.
+3. Replica el clip contra la ventana de texto activa (`GxFont_GetCommonInfo()`, offsets `+0x38/+0x3c/
+   +0x40/+0x44` = x/y/ancho/alto del clip) con la formula literal de `out_ghidra.c:9917-9943` -- incluida su
+   asimetria entre clip-izquierda y clip-derecha (no se "corrigio" sin evidencia; un glifo individual
+   practicamente nunca choca contra ambos bordes del clip a la vez en el juego real).
+4. Encola el glifo como un quad MAS en la MISMA cola que los sprites (`gpu_quads_enqueue_text()`, nuevo en
+   `gpu_quads.c`/`.h`) -- mismo cache por contenido (reusa `gq_hash`/`gq_find`/`gq_insert_slot`, con un
+   discriminador de `op` fuera de rango para no colisionar con sprites reales), mismo blend premultiplicado
+   `GL_ONE/GL_ONE_MINUS_SRC_ALPHA` que ya usa `gpu_quads_flush()` para sprites -- CERO cambios en el flush.
+   Su posicion en la cola (que se dibuja en orden de insercion) pasa a reflejar el momento REAL en que el
+   motor llamo a `drawString`, igual que un sprite -- esto es lo que restaura el z-order correcto contra
+   paneles/UI.
+5. Nunca llama al original -- el quad reemplaza el efecto visual completo del blend por software, asi que
+   la capa base queda "limpia" (solo primitivas `CGsGraphics`), consistente con la asuncion de diseno de la
+   Fase 50 de que la capa base es solo fondo/fills.
+
+Recompilado `--gpu-quads-test`. **Pendiente confirmar en consola**: que el texto (tips, guardado,
+aceptacion, descripcion de items, opciones, ayuda) aparezca, y que el z-order contra paneles/UI se vea
+correcto. Si aparece pero mal posicionado/clippeado, el primer sospechoso es la formula de clip del punto 3
+(replicada tal cual del original, no verificada en consola todavia con texto real dentro de una ventana
+angosta).
+
+## Fase 60: EL TEXTO SE VE EXCELENTE (Fase 59 confirmada en consola) -- pero el blanqueo total de la
+## Fase 58 rompio el fondo oscuro/traslucido de los cuadros de tips/guardado ("se distorsiona
+## completamente el juego") -- fix acotado por tamano de quad en vez de por valor (2026-07-20)
+
+`logs/log_1784591725.txt` (19:55, generado despues del build con la Fase 59 -- confirmado por mtimes:
+`dynlib.c`/`gpu_quads.c` 19:43-44, vpk 19:50). **El usuario confirma que el texto ya se ve excelente** --
+la Fase 59 (desviar `CGxFACharCache::DrawToFrameBuffer` a la cola de quads) funciono.
+
+**Bug nuevo reportado**: al cambiar de stage, el cuadro de tips aparece SIN fondo (deberia tener uno negro
+para legibilidad, "igual que cuando el title/gamevil salian en negro" -- el usuario mismo nota el paralelo
+con el bug anterior); lo mismo al guardar la partida. Resultado: "se distorsiona completamente todo el
+juego haciendolo injugable".
+
+**Diagnostico (sin necesitar un log nuevo -- se ve el problema releyendo el propio fix de la Fase 58)**: el
+fix de la Fase 58 (glColorPointer_wrapper) reemplaza CUALQUIER color-array UByte(size=4) por un buffer
+blanco `memset(...,0xFF,...)` -- **blanco Y OPACO (alpha=255), no solo blanco**. El log de esta sesion NO
+muestra ningun cambio de VALOR adicional para este mecanismo aparte del ya conocido (232,23,16,129) durante
+el splash -- pero eso no prueba que el cuadro de tips/guardado no use el MISMO mecanismo: si lo usa, la
+Fase 58 lo estaria forzando a blanco opaco sin importar que color/alpha traiga el motor -- un cuadro
+pensado como oscuro/traslucido saliendo BLANCO SOLIDO explica bien un sintoma tan drastico ("distorsiona
+completamente", no solo "le falta un detalle").
+
+**Fix (acotado, no otro sentinel de valor)**: la decision de blanquear se mueve de `glColorPointer_wrapper`
+a `glDrawArrays_wrapper`, que es donde ya se conoce el tamano REAL en pantalla del quad que se esta
+dibujando (a partir del bounding box de los vertices que van a esa misma llamada, sean `GL_FIXED` ya
+convertidos o `GL_FLOAT` directos). Ahora solo se fuerza blanco cuando el quad cubre aproximadamente la
+PANTALLA COMPLETA (`w>900 && h>500`) -- el UNICO caso con evidencia real de estar roto (Fase 51-53, 500+
+frames en 3 pantallas). Cualquier OTRO uso de este mecanismo, sea el tamano que sea, se deja pasar con su
+color/alpha original SIN TOCAR -- si el cuadro de tips/guardado usa este mecanismo con un valor oscuro
+legitimo, ahora deberia volver a verse.
+
+Se agregaron 3 diagnosticos (capados a 20 lineas c/u): `color-array blanqueado (quad WxH, pantalla
+completa)`, `color-array UByte SIN tocar (quad WxH, no es pantalla completa) color=(...)`, y `color-array
+UByte con extent DESCONOCIDO` (por si ningun vertex pointer conocido aplica -- no deberia pasar en la
+practica, pero deja evidencia si pasa). Estos tambien sirven para CONFIRMAR o DESCARTAR de una vez la
+hipotesis de este fix con el proximo log real: si el cuadro de tips/guardado aparece en el log con
+`color=(algo oscuro)` y `SIN tocar`, la hipotesis es correcta; si nunca aparece un `UByte` chico durante ese
+cuadro, el fondo negro del cuadro usa un mecanismo DISTINTO (candidato: un sprite `.pzx` semitransparente
+via `PutCompressImg`, no glColorPointer) y hay que seguir investigando por ese lado.
+
+**Advertencia honesta**: no hay evidencia directa todavia (log posterior a este fix) de que el cuadro de
+tips/guardado realmente use `glColorPointer` -- es la hipotesis mas consistente con "se distorsiona
+completamente" (blanco opaco tapando todo en vez de un dim traslucido) y con el paralelo que señalo el
+propio usuario con el bug del logo, pero se corrige el riesgo conocido sin esperar confirmacion porque es
+estrictamente mas seguro que el estado anterior (nunca puede reintroducir el bug del logo/title, que sigue
+cubierto por el chequeo de tamano de pantalla completa) aunque termine siendo una causa distinta.
+**Pendiente**: instalar, reproducir un cambio de stage con tip Y un guardado, mandar el log.
+
+## Fase 61: la Fase 60 descarto glColorPointer (CERO usos chicos en todo el log) -- causa real encontrada
+## en `out_ghidra.c`: los fondos solidos con alpha (CGsGraphics::DrawFillRect/etc.) escriben DIRECTO al
+## framebuffer via Screen_RGBBLEND16_Real, el MISMO bug de la Fase 59 pero para rellenos, no texto
+## (2026-07-20)
+
+`logs/log_1784592729.txt` (20:12, build 20:11:24, source 20:07:37 -- log fresco post-Fase-60). Los 3
+diagnosticos nuevos de la Fase 60 dieron un resultado CONCLUYENTE: **20 lineas de "color-array blanqueado
+(quad 960x544)" (solo el splash, ya conocido) y CERO lineas de "SIN tocar"/"extent DESCONOCIDO" en las
+~950 lineas restantes**, que cubren dos guardados y multiples transiciones de UI. Esto descarta la hipotesis
+de la Fase 60 con evidencia real: los cuadros de tips/guardado/objetos NO usan `glColorPointer` en absoluto
+-- ni siquiera con un valor "legitimo" que el nuevo criterio dejaria pasar. Hay que buscar la causa en otro
+lado.
+
+**Causa real (Ghidra, no adivinada)**: buscando que otra funcion podria pintar un rectangulo solido con
+alpha, `CGsGraphics::DrawFillRect` (`out_ghidra.c:23543`) resulto llamar a `RGBBlend16`/`g_funcRGBBlend16`
+-- **exactamente el mismo patron de bug que el texto de la Fase 59**: una funcion que escribe DIRECTO al
+framebuffer de software (nunca pasa por `PutCompressImg`), asi que con GPU_QUADS queda atrapada en la capa
+base, siempre DEBAJO de todos los sprites/paneles desviados a GPU sin importar el orden real de llamadas
+del motor -- el mundo/UI (ahora quads) tapa el relleno (que quedo en la capa base), por eso se ve
+"completamente transparente" en vez del negro traslucido esperado. Mismo mecanismo probable para el mapa
+que falta arriba a la derecha, si su marco/fondo usa el mismo camino (el usuario noto el paralelo
+correctamente).
+
+`RGBBlend16` (simbolo real `_Z10RGBBlend16iiiiji`) es en si un wrapper delgado sobre un puntero de funcion
+global `g_funcRGBBlend16` (mismo patron de indireccion que `g_funcZeroCopy`/`g_funcEnlarge`, ya manejado en
+`sprite_decode.c` para sprites) -- pero la mayoria de los >15 call sites reales en `out_ghidra.c` llaman a
+`g_funcRGBBlend16` DIRECTO, sin pasar por el wrapper, asi que hookear el wrapper solo agarraria una
+fraccion. Se hookea en cambio `Screen_RGBBLEND16_Real` (`_Z22Screen_RGBBLEND16_Realiiiiji`) -- la funcion
+REAL a la que `g_funcRGBBlend16` apunta despues de `CMvGraphics::InitialBlend()`
+(`SetScreenEffectFunc(1, Screen_RGBBLEND16_16+1, Screen_RGBBLEND16_Real+1)`, confirmado en
+`out_ghidra.c:142909`) -- hookear por DIRECCION intercepta TODOS los call sites sin importar si llegan via
+el wrapper o el puntero directo, igual que `PutCompressImg_hook`.
+
+**Fix**: nuevo hook (`dynlib.c`, `Screen_RGBBLEND16_Real_hook`/`zenonia_install_screen_fill_quads_hook`,
+instalado junto a los otros en `main.c`, solo bajo `ZENONIA_GPU_QUADS`) que lee `(x,y,w,h,color565,alpha4)`
+directo de los parametros (formato confirmado: `color565` es RGB565 estandar -- las mascaras de bits de
+`Screen_RGBBLEND16_16` como `0x8610` marcan el MSB de cada canal en el orden R:15-11/G:10-5/B:4-0 exacto;
+`alpha4` es 0-15, NO 0-255 -- confirmado en el chequeo `(uint)param_6 < 0x10` y en
+`CGsGraphics::DrawFillRect` pasando `GetAlpha()>>4`), y en vez de dejarlo escribir al framebuffer, lo
+convierte a RGBA8 y lo encola como quad (`gpu_quads_enqueue_fill()`, nuevo en `gpu_quads.c`/`.h`) en la
+MISMA cola que sprites y texto -- restaurando su orden real contra ambos. A diferencia de un sprite/glifo,
+un relleno solido no tiene "datos" que decodificar: se cachea una textura de 1x1 por (color,alpha) y GL la
+estira sobre cualquier tamano de quad via texture coordinates, sin generar un buffer del tamano real del
+rectangulo. Esto requirio un cambio de infraestructura menor en `gpu_quads.c`: `gq_quad` ahora guarda su
+propio `w,h` (antes tomaba el tamano de la entrada de cache `e->w/e->h`, que para sprites/texto coincide
+siempre con el tamano decodificado pero para un relleno de 1x1 NO tendria sentido) -- los 3 sitios de
+encolado (`gpu_quads_lookup_and_enqueue`, `gpu_quads_finish_decode`, `gpu_quads_enqueue_text`) y
+`gpu_quads_flush` se actualizaron para usar el tamano por-quad en vez del de la entrada.
+
+`Screen_RGBBLEND16_Real` ya clippea contra los limites del main screen buffer antes de escribir -- no hace
+falta replicar ese clip (a diferencia del clip de texto de la Fase 59, que es contra una ventana LOCAL de
+dialogo): un quad GL fuera del viewport simplemente no se rasteriza, mismo resultado final.
+
+**Sobre "se distorsiona todo el juego al cambiar de stage" (sintoma separado, todavia sin diagnosticar)**:
+no hay evidencia todavia de que este mismo mecanismo explique la distorsion durante la TRANSICION de stage
+en si (a diferencia del fondo del cuadro de tips, que es un sintoma post-transicion). Candidato sin
+confirmar: `SetScreenEffectFunc` maneja tambien modos 0/2/3 (`Screen_FADEOUT16`/`Screen_WAVEH`/
+`Screen_WAVEV`, funciones DISTINTAS a `Screen_RGBBLEND16_Real`, no cubiertas por este fix) -- "wave"
+horizontal/vertical es un efecto clasico de transicion de pantalla con distorsion visual real por diseno,
+podria estar interactuando mal con GPU_QUADS de una forma que todavia no se investigo. **Pendiente**:
+instalar, reproducir (a) un cambio de stage completo (para ver si la distorsion persiste), (b) un tip, (c)
+un guardado, (d) mirar si el mapa aparece, y mandar el log.
+
+## Fase 62: Fase 61 CONFIRMADA (tips/guardado con fondo negro correcto) -- pero el cuadro de "objeto
+## recogido" sigue sin fondo; hallazgo de un TERCER caso del mismo bug (esquinas redondeadas via
+## DrawNativeFillEllipse) + fixes bonus no buscados (vida de enemigos) (2026-07-20)
+
+`logs/log_1784594058.txt` (20:34, build 20:32:49, source 20:24-27 -- fresco). Resultados del usuario:
+
+- **(a) La distorsion al cambiar de stage SIGUE** (esta vez aparecio en el segundo stage de la ronda) --
+  todavia sin diagnosticar, ver la hipotesis de `Screen_WAVEH_Real`/`Screen_WAVEV_Real` anotada en la Fase
+  61 (funciones DISTINTAS a `Screen_RGBBLEND16_Real`, no cubiertas por ningun fix hasta ahora).
+- **(b) CONFIRMADO** -- el cuadro de tips/loading ya tiene su fondo negro, se puede leer.
+- **(c) CONFIRMADO** -- el cuadro de guardado tambien.
+- **(d) Parcial**: las coordenadas del minimapa (texto) ya aparecen (consistente con el fix de texto de la
+  Fase 59, que no distingue "para que UI se usa" un glifo) pero el MAPA en si (el grafico/thumbnail del
+  terreno) sigue completamente transparente, y tocar esa zona muestra "mucho texto transparente" (otro
+  indicio de texto sin su fondo, mismo patron que (b)/(c) pero en un lugar que este fix todavia no cubre).
+- **No pedido, reportado como bonus**: la vida de los enemigos ahora SI disminuye al golpearlos (antes no).
+  No se identifico que fix especifico causo esto -- candidato mas probable es el fix de color-array de la
+  Fase 60 (si la barra de vida se dibuja con un color-array UByte chico que la Fase 58 forzaba a blanco
+  opaco, tapando visualmente el cambio de vida aunque el dato SI se actualizaba en memoria -- o sea, nunca
+  fue un bug de logica de juego, era un bug visual que parecia de logica). Sin confirmar, no crítico.
+- **Reportado como excepcion**: el cuadro de "objeto recogido" (item pickup) tiene texto visible pero
+  "curiosamente" le sigue faltando el fondo negro traslucido, a diferencia de tips/guardado que ya
+  funcionan con el mismo fix de la Fase 61.
+
+**Investigacion de por que tips/guardado se arreglaron pero "objeto recogido" no**: buscando que otra
+funcion podria fallar especificamente para ESE cuadro, `CGsGraphics::DrawFillRoundRect`
+(`out_ghidra.c:24187`) resulto tener DOS caminos segun el radio de esquina (`param_5`): para radios chicos
+(<8px) todo pasa por `RGBBlend16` (ya cubierto, Fase 61); para radios GRANDES (>7px, un estilo de esquinas
+bien redondeadas -- plausible para un popup llamativo tipo "objeto recogido") las 4 esquinas se dibujan con
+`CGsGraphics::DrawNativeFillEllipse` (out_ghidra.c:24037) y SOLO el centro/cruz sigue yendo por
+`RGBBlend16` -- si el cuadro de item pickup usa este estilo, sus 4 esquinas (y posiblemente el fondo
+completo, si el centro tambien queda visualmente incompleto sin las esquinas) quedarian sin cubrir. Esta es
+una HIPOTESIS con evidencia indirecta (el patron de codigo existe y calza con el sintoma), no confirmada
+todavia con un log que muestre la ruta de codigo real usada para ESE cuadro especifico.
+
+**`DrawNativeFillEllipse` es TOTALMENTE independiente de `RGBBlend16`** -- rasteriza la elipse Y hace su
+propio blend alpha por pixel, escribiendo directo al framebuffer (mismo patron de bug que texto/rects,
+Fase 59/61, pero codigo de blend duplicado, no una llamada mas al mismo mecanismo). Formato de color
+CONFIRMADO distinto al de `RGBBlend16`: si `color < 0x10000` es RGB565 crudo con alpha implicito 0xFF
+(opaco); si no, es ARGB8888 real (`alpha=color>>24`).
+
+**Fix aplicado, con una salvaguarda importante**: nuevo hook (`dynlib.c`,
+`DrawNativeFillEllipse_hook`/en `zenonia_install_screen_fill_quads_hook`) que convierte el llamado a un
+quad SOLO cuando `quadrant` tiene EXACTAMENTE UN bit prendido (1/2/4/8 -- el patron real de las 4 llamadas
+de esquina de `DrawFillRoundRect`). **`CGsGraphics::DrawFillEllipse` (circulos/ovalos genuinos de la UI,
+no esquinas) llama a la MISMA funcion con `quadrant=0xf` (out_ghidra.c:24181)** -- desviar ESE caso a un
+quad cuadrado habria sido una regresion real (un circulo autentico se veria como un cuadrado solido). Para
+`quadrant` != un solo bit, se delega al original sin cambiar nada (ni mejor ni peor que antes).
+
+**Limitacion conocida y aceptada**: el quad de esquina es el RECTANGULO completo `x,y,w,h`, no el arco
+exacto del cuadrante -- las esquinas quedan CUADRADAS en vez de redondeadas (unos pocos pixeles, el radio
+tipico de una UI). Preferido sobre nada: pasar de "fondo invisible" a "fondo visible con esquinas apenas
+cuadradas" es mejora neta; el arco exacto necesitaria una textura con mascara de alfa por cuadrante.
+
+**Sin resolver, pendiente de mas evidencia**: (1) el mapa en si (grafico de terreno) sigue transparente --
+candidato sin confirmar: el terreno podria dibujarse pixel por pixel (`PutPixel`/`DrawLine` de
+`CGsGraphics`, NO `RGBBlend16` ni `DrawNativeFillEllipse`) en vez de como un relleno o sprite, otro camino
+de escritura directa al framebuffer todavia no identificado; (2) la distorsion en transiciones de stage,
+candidato sin confirmar: `Screen_WAVEH_Real`/`Screen_WAVEV_Real` (modos 2/3 de `SetScreenEffectFunc`,
+funciones DISTINTAS, no tocadas por ningun fix hasta ahora). **Pendiente**: instalar, reproducir de nuevo
+un objeto recogido (para confirmar/descartar la hipotesis de esquinas redondeadas), un cambio de stage
+aislado (sin tip/guardado en el medio si es posible, para no mezclar variables), y mirar la zona del
+minimapa, mandar el log.
+
+## Fase 63: la Fase 62 (esquinas redondeadas) NO resolvio el objeto recogido -- dato nuevo clave del usuario
+## (menu de pausa SI tiene fondo, el HUD IN-GAME no, en NINGUN cuadro) cambia el diagnostico -- se
+## instrumenta en vez de adivinar un cuarto mecanismo a ciegas (2026-07-20)
+
+Dos logs nuevos (`log_1784594980.txt` 20:49, `log_1784595647.txt` 21:00, ambos post-build 20:48:36/fuente
+20:44:47 -- frescos). Resultados del usuario:
+
+- **(a) La distorsion al cambiar de stage es 100% la pantalla de tips/loading** -- el usuario aclara que no
+  se puede cambiar de stage SIN pasar por esa pantalla, y el error aparecio en el stage 1 la primera ronda
+  y en el stage 2 la segunda -- o sea, no es especifico de un stage, es especifico del EVENTO
+  tip/loading. Esto CAMBIA la hipotesis de la Fase 61/62 (efectos "wave" de `SetScreenEffectFunc`
+  modos 2/3): mas probable que la "distorsion" sea el MISMO sintoma que "falta el fondo negro" del tip,
+  simplemente mas notorio en loading porque lo que queda visible detras del texto sin fondo es contenido de
+  transicion/pantalla parcialmente redibujada en vez de una escena de juego estable.
+- **(b) El objeto recogido SIGUE sin fondo** -- la hipotesis de esquinas redondeadas (Fase 62) no lo
+  explico, o no es la causa (todavia no se sabe cual de las dos sin el diagnostico nuevo).
+- **(c) El minimapa mejoro parcialmente**: antes "completamente transparente", ahora "negro transparente de
+  dos tonalidades" pero sin poder verse el detalle del terreno -- probablemente efecto lateral de la Fase
+  61 (algo SI se esta pintando ahi ahora) pero el contenido real (thumbnail de terreno) sigue sin
+  aparecer.
+- **Dato nuevo clave, cambia todo el diagnostico**: **"Todos los textos del menu de pausa tienen su fondo
+  negro transparente u otro color y se puede leer, PERO en el juego como tal es donde no los tiene
+  NINGUNO, ni el de savegame."** Esto contradice la lectura de la Fase 61 (que asumio "tips y guardado ya
+  funcionan" en base a una prueba que, en retrospectiva, probablemente paso por el MENU DE PAUSA, no por
+  un guardado/tip real durante el juego). La distincion real parece ser **menu de pausa (funciona) vs.
+  HUD/dialogos in-game (no funciona)**, no "tips vs. guardado vs. pickup" como se penso hasta ahora.
+
+**No se aplico un cuarto fix a ciegas esta vez** -- buscar en `out_ghidra.c` una clase Zenonia-especifica
+para dialogos in-game (`CZnTip`/`CZnMessageBox`/etc.) no dio resultado (`grep` de clases `CZn*`: solo
+`CZnBankMenu/BoltEffect/CharaterSelectMenu/DimensionRoom/Homing/ParticleEffect/PvpMenu/Shop/TouchKeypad/
+TouchMenu/WorldMap` -- ninguna candidata obvia para tips/save/pickup). Sin un candidato solido nuevo,
+seguir adivinando una quinta funcion arriesga otro ciclo de "arreglar algo, no ser lo que hacia falta".
+
+**Instrumentacion agregada en cambio** (`dynlib.c`, capada a 300/100 lineas, deduplicada por valor):
+`Screen_RGBBLEND16_Real_hook` y `DrawNativeFillEllipse_hook` (rama de esquina) ahora loguean CADA llamada
+real con `(x,y,w,h,color,alpha,ui_status)` bajo `[FillQuadsDiag]`. Esto responde de una la pregunta
+central: **¿el HUD in-game llega a llamar a alguno de estos dos mecanismos en absoluto durante un tip/
+guardado/pickup?** Si NO aparece ningun `[FillQuadsDiag]` durante esos momentos (mientras que SI aparecen
+durante el menu de pausa), confirma que el HUD in-game usa un camino completamente distinto (busqueda
+distinta, probablemente no una primitiva CGsGraphics sino algo mas especifico del HUD de Zenonia); si SI
+aparece pero con datos raros (alpha=0, w/h=0, color equivocado), el bug esta en otro lado (el clip/quad, no
+en si el mecanismo se llama).
+
+Recompilado `--gpu-quads-test`. **Pendiente**: instalar, reproducir especificamente un tip/loading de
+cambio de stage Y un guardado real durante el juego (no desde el menu de pausa) Y un objeto recogido, y
+mandar el log -- las lineas `[FillQuadsDiag]` (o su ausencia) durante esos momentos van a decir por donde
+seguir sin adivinar mas.
+
+## Fase 64: el diagnostico de la Fase 63 SI se dispara durante gameplay normal (confirma datos reales
+## interesantes -- minimapa, barras) pero el dedupe estaba mal disenado y agoto el cupo ANTES de llegar
+## al guardado real que se queria observar -- corregido, falta un log nuevo (2026-07-20)
+
+`logs/log_1784596936.txt` (21:22, post-build 21:21:00/fuente 21:07:45 -- fresco, el usuario reprodujo todo
+lo pedido: tip/loading de cambio de stage, guardado real jugando, objeto recogido).
+
+**El diagnostico SI aparece durante gameplay normal (ui_status=14)** -- esto ya es informacion real
+valiosa, no solo ruido:
+- Un rect de pantalla completa `(0,0,960,544)` negro con alpha variable (12→204 y 15→255) se redibuja cada
+  frame durante gameplay -- candidato: alguna capa de composicion o vineta, no confirmado que sea visible
+  como tal en el resultado final (no genero ninguna queja de "se ve muy oscuro" del usuario).
+- Una caja `(784,33,96,74)` negra alpha~204 -- coincide con la posicion del RECUADRO del minimapa (esquina
+  superior derecha).
+- Bloques chicos de 4x4/4x20 con colores VIVOS (`0xf80a`→rosa/rojo `(255,0,82)`, `0x77e0`→verde
+  `(115,255,0)`) en esa MISMA zona (877-900, y=26-36) -- son casi seguro los PUNTOS/MARCADORES del
+  minimapa (jugador, objetivos), y **SI pasan por `RGBBlend16`** -- ya cubiertos por el fix de la Fase 61 en
+  teoria. Si el usuario los sigue viendo como "dos tonalidades de negro" en vez de estos colores reales, el
+  problema no es que no se llame al mecanismo (se confirma que si) sino un posible problema de ORDEN: si el
+  recuadro de fondo `(784,33,96,74)` se encola DESPUES de estos puntitos en la misma cola de quads, los
+  tapa (dibujados despues = arriba). Sin confirmar todavia -- necesita un diagnostico de ORDEN, no solo de
+  "se llama o no", para esta hipotesis especifica.
+- Barras chicas `(308,509,2,12)` y `(343,535,309,5)` cerca del borde inferior -- candidato: bordes/relleno
+  de una barra de HP/MP o el area tactil de controles virtuales.
+
+**El bug real de este intento**: el dedupe de la Fase 63 comparaba solo contra el ULTIMO valor visto, no
+contra un conjunto acumulado -- el HUD normal cicla entre ~10 rects fijos TODOS los frames (barras, puntos
+de minimapa), y como cada uno es "distinto al anterior" dentro del ciclo, el cupo de 300 lineas se
+gastaba entero re-logueando ese mismo ciclo una y otra vez. Confirmado con los numeros de linea: el cupo se
+agoto en la linea 1185, pero el guardado real (`saveFile: Save0.dat`) recien ocurre en la linea 1253 -- el
+diagnostico nunca llego a ver el momento que se queria observar.
+
+**Fix**: el dedupe ahora es por CONJUNTO de valores ya vistos (array de hasta 128/64 entradas, busqueda
+lineal) en vez de "distinto del ultimo" -- una vez que el HUD normal (un puñado fijo de rects) esta todo
+"visto" (deberia converger en los primeros segundos de juego), el cupo queda libre para lo que aparezca
+DESPUES (un dialogo real de tip/guardado/pickup). Recompilado `--gpu-quads-test`. **Pendiente**: instalar,
+repetir exactamente la misma secuencia (cambio de stage, guardado real, objeto recogido) y mandar el log --
+esta vez las lineas `[FillQuadsDiag]` deberian llegar hasta esos momentos especificos en vez de agotarse
+en el HUD de fondo.
+
+## Fase 65: buenas noticias de avance de historia, pero FPS cayo a 5-7 en un mundo nuevo -- el diagnostico
+## de la Fase 64 revelo la causa real (el minimapa dibuja CIENTOS de bloques individuales por frame) y se
+## optimizo el camino caliente en vez de agregar mas hooks (2026-07-20)
+
+`logs/log_1784597812.txt` (21:36, post-build 21:35:56/fuente 21:29:20 -- fresco). El usuario reporta
+**progreso real**: sin distorsion, pudo avanzar la historia con todo el texto funcionando. El mapa sigue
+sin verse (ahora prioridad baja para el usuario) pero **el problema mas importante es que este "mundo
+nuevo" bajo el framerate a 5-7 FPS** (vs. ~15-20 en areas anteriores).
+
+**El diagnostico de la Fase 64 (todavia activo en este build) revelo la causa real de una sola vez, sin
+necesitar otra ronda de logs**: el cupo de 128 lineas se agoto en la linea 1069 (antes de llegar al
+guardado real en la 1157, otra vez) -- pero esta vez el cupo se gasto en algo MUY revelador: **cientos de
+posiciones (x,y) UNICAS y distintas, todas con el mismo color, formando bloques de 4x4 y 4x20 pixeles
+dispersos en el area del minimapa (x~830-954, y~22-118)**. Esto confirma que **el minimapa no se dibuja
+como un sprite o un puñado de rellenos -- se dibuja PIXEL POR PIXEL (o bloque por bloque) via
+`RGBBlend16`**, un patron de uso completamente distinto (volumen altisimo, cientos de llamadas SOLO para
+el minimapa) al que motivo el hook original de la Fase 61 (unos pocos rellenos grandes por frame, paneles
+de dialogo). El "mundo nuevo" con mas FPS perdido probablemente tiene un area de mapa explorada mas grande
+o mas detalle de terreno visible, generando mas bloques todavia.
+
+**El costo real, identificado sin adivinar**: cada uno de esos cientos de bloques ahora pasa por todo el
+pipeline de quads (hash + busqueda en cache + encolado) en vez de ser una escritura de memoria trivial
+directa (lo que costaba en el motor original) -- y el diagnostico de la Fase 63/64, que hacia un scan
+lineal de hasta 128 entradas EN CADA LLAMADA (no solo las primeras N, seguia escaneando aun sin loguear
+mas), sumaba su propio costo real encima de eso, exactamente en el peor momento (esta area con mas detalle
+de minimapa que ninguna otra vista hasta ahora).
+
+**Fix, 3 partes, todas de bajo riesgo (optimizan el camino, no cambian que se dibuja)**:
+1. **Retirado el diagnostico de la Fase 63/64** (`dynlib.c`, ambos hooks) -- ya cumplio su proposito real
+   (confirmar que el mecanismo se llama y encontrar el patron de uso del minimapa), su costo ya no se
+   justifica.
+2. **Atajo MRU (most-recently-used) en `gpu_quads_enqueue_fill`** (`gpu_quads.c`) -- el patron dominante
+   observado en consola son corridas largas de llamadas CONSECUTIVAS con el mismo (color,alpha) exacto
+   (el mismo tipo de bloque de terreno repetido). Si la clave actual es identica a la de la llamada
+   anterior, se salta `gq_hash`/`gq_find` por completo y se reusa directo el puntero a la entrada de cache
+   ya resuelta -- con una verificacion barata de que esa entrada sigue siendo valida (no fue reciclada por
+   el anillo de desalojo para otra clave mientras tanto) antes de confiar en el atajo.
+3. **Evitar `glBindTexture` redundante en `gpu_quads_flush`** (`gpu_quads.c`) -- si el quad actual usa la
+   MISMA textura GL que el anterior (tambien el patron dominante para el minimapa), se saltea la llamada a
+   `glBindTexture` -- una llamada a la API GL menos por quad en corridas del mismo color.
+
+**No se ataco todavia** (candidato de mayor impacto si esto no alcanza): **batchear** todos los quads que
+comparten la MISMA textura en una sola llamada a `glDrawArrays` con un buffer de vertices combinado, en vez
+de una llamada de dibujo POR QUAD -- reduciria cientos de draw calls del minimapa a un puñado, pero es un
+cambio mas invasivo (requiere agrupar/ordenar la cola por textura antes del loop de dibujo) que no se
+intento esta vez para no arriesgar otra regresion sin medir primero el efecto de los 3 fixes mas simples de
+arriba.
+
+Recompilado `--gpu-quads-test`. **Pendiente**: instalar, volver a esa misma zona/mundo nuevo y confirmar si
+el FPS mejora. Si sigue en 5-7, el batching de arriba es el siguiente paso logico (ya con el diagnostico
+retirado, para medir el costo real de los draw calls sin el ruido del logging).
+
+## Fase 66: FPS CONFIRMADO arreglado (15-20 de vuelta) -- hallazgo nuevo en `out_ghidra.c` que reencuadra
+## el bug de fondos in-game como un problema de ORDEN, no de mecanismo -- diagnostico especifico agregado
+## (2026-07-20)
+
+`logs/log_1784599569.txt` (22:06, post-build 22:04:31/fuente 21:51-52 -- fresco). **El usuario confirma
+que el FPS volvio a 15-20**, igual que antes del area con problemas -- los 3 fixes de la Fase 65
+funcionaron.
+
+**Bugs de transparencia in-game siguen igual** (nombres de objetos en el suelo, al recogerlos, al guardar
+jugando; en el mapa solo se ven los puntos rojo/rosa y verde, no el personaje ni las puertas/portales).
+**Nuevo, mas chico**: el popup de guardado DESDE EL MENU DE PAUSA ahora tiene su texto superior
+transparente (el fondo negro sigue bien) -- distinto de "todo el popup transparente", parece un problema
+mas acotado, posiblemente de cache de texto (Fase 55) para ese elemento puntual, sin investigar todavia.
+
+**Hallazgo clave (leyendo mas `out_ghidra.c`, no otro log)**: se encontro `CMvFieldItemObject` (el objeto
+"item en el campo/suelo") y, siguiendo la cadena de dibujo del texto de objetos, `CMvItem::
+DrawExplainBackPlane` -> `CMvGameUI::DrawExplainBackPlane` (`out_ghidra.c:52319`) -> **`CGsGraphics::
+DrawFillRoundRect` con radio=5 SIEMPRE (confirmado en los 3 call sites reales)**. Radio 5 cae en el rango
+`4 <= radio <= 7` de `DrawFillRoundRect`, que usa **SOLO `RGBBlend16`** (no `DrawNativeFillEllipse` --
+ese camino es solo para radio>7). Es decir: **el backdrop de objetos/tips/guardado in-game usa el MISMO
+mecanismo que el menu de pausa (ya arreglado en la Fase 61)**, no un mecanismo sin descubrir como se
+sospechaba desde la Fase 63.
+
+**Nueva hipotesis, mas probable que "existe una quinta funcion sin encontrar"**: si el mecanismo es el
+mismo y ya esta desviado a quad correctamente, la razon mas probable de que el menu de pausa se vea bien y
+el HUD in-game no es un problema de **ORDEN dentro de la cola de quads**: el menu de pausa es
+probablemente lo ULTIMO que el motor dibuja en su frame (nada se encola despues, el quad del fondo queda
+arriba de todo por default). Un popup in-game (tip/guardado/item), en cambio, podria dibujarse ANTES de
+otros elementos del mismo frame (HUD, efectos, el propio mundo) que tambien son quads ahora -- esos quads,
+encolados DESPUES, se dibujan ENCIMA del backdrop del popup en `gpu_quads_flush()` (que siempre pinta la
+cola completa en orden de insercion), tapandolo -- exactamente el mismo tipo de bug de "orden perdido"
+que motivo las Fases 59/61/62, pero esta vez ENTRE dos quads distintos (backdrop vs. sprites), no entre
+un quad y la capa base de software.
+
+**Diagnostico agregado** (`gpu_quads.c`, capado a 60 lineas totales, filtrado a rellenos "de panel"
+`w*h>500` para no repetir el ruido de bloques de minimapa de las Fases 63/64): cada vez que se encola un
+relleno de panel, se guarda su POSICION en la cola de ese frame; en `gpu_quads_flush()`, justo antes de
+resetear la cola, se loguea cuantos quads mas quedaron encolados DESPUES de cada panel observado
+(`residual`). Un `residual` alto para un popup in-game (vs. bajo/cero para el menu de pausa) confirmaria la
+hipotesis de orden. Recompilado `--gpu-quads-test`. **Pendiente**: instalar, reproducir un objeto en el
+suelo/recogerlo, un guardado in-game, y el guardado desde pausa (para comparar), mandar el log -- las
+lineas `[GpuQuadsDiag] panel w=... h=... idx=... residual=...` van a decir si la hipotesis de orden es
+correcta.
+
+## Fase 67: los datos de "residual" de la Fase 66 resultaron AMBIGUOS -- un residual alto no prueba nada
+## por si solo (puede ser contenido chico que no se superpone en pantalla) -- diagnostico extendido con
+## chequeo de superposicion REAL antes de sacar conclusiones (2026-07-20)
+
+`logs/log_1784606339.txt` (23:58, post-build 23:58:03/fuente 22:16:49 -- fresco). Los datos del diagnostico
+de la Fase 66 salieron, pero **no permiten confirmar la hipotesis de orden todavia**:
+
+- El trio `(960x544, 96x74, 589x346)` en indices (1,2,7) con residual 120-180 **NO es el menu de pausa
+  como se penso** -- aparece INMEDIATAMENTE al entrar a `ui_status=14` (gameplay normal, confirmado por
+  `[Java] OnUIStatusChange: 14` justo antes en el log), y se repite CADA FRAME de juego normal. Es mas
+  probable que sea la capa de FONDO del HUD (fondo de barra de vida/minimapa/area de dialogo), dibujada a
+  proposito TEMPRANO en el frame -- un residual alto ahi es el comportamiento ESPERADO (el resto del HUD
+  se dibuja legítimamente encima), no un bug.
+- Un `loadFile: Save0.dat` (carga de partida/transicion) genero, en el MISMO frame, un `960x544` en un
+  indice MAS TARDIO (133, no 1) y un panel `102x102` con **residual=9** (bajo) -- si esto es el popup de
+  loading/tip, un residual bajo sugeriria que SI queda arriba de casi todo... pero sin saber si algo
+  GRANDE lo tapa especificamente, el numero solo no alcanza para concluir nada.
+
+**El problema real del diagnostico de la Fase 66**: "residual" (cuantos quads mas se encolaron despues)
+no distingue "hay 130 puntitos de HUD en otras zonas de la pantalla que no tapan nada" de "hay un sprite
+grande exactamente encima, tapando todo". Se necesita chequear SUPERPOSICION REAL en pantalla, no solo
+orden de la cola.
+
+**Extension del diagnostico** (`gpu_quads.c`, misma cola de 60 lineas, se agregan `x,y` a los rects
+observados): para cada panel vigilado, se escanean los quads posteriores en la MISMA cola y se cuenta
+cuantos tienen un rectangulo que REALMENTE INTERSECTA (test AABB) al panel Y son lo bastante grandes para
+importar (`w*h>100`, descarta puntitos de minimapa) -- `overlap_count` y `overlap_max_area` (el area del
+quad tapador mas grande encontrado). Formato nuevo: `[GpuQuadsDiag] panel x=... y=... w=... h=... idx=...
+residual=... overlap_count=... overlap_max_area=...`. Un `overlap_count>0` con `overlap_max_area` grande
+para un popup in-game (vs. 0 para el HUD de fondo normal, que se espera que SI tenga contenido encima por
+diseno) seria evidencia directa y concluyente. Recompilado `--gpu-quads-test`. **Pendiente**: instalar,
+repetir la misma secuencia (item en el suelo/recogerlo, guardado in-game, guardado desde pausa para
+comparar), mandar el log.
+
+## Fase 68: los datos de overlap de la Fase 67 llegaron pero el evento de "recoger el objeto" (reportado
+## "casi al final") no quedo capturado -- el mismo bug de agotamiento de cupo de las Fases 63/64, esta vez
+## en el diagnostico nuevo -- corregido con el mismo dedupe por conjunto (2026-07-20)
+
+`logs/log_1784606800.txt` (00:06, post-build 00:05:58/fuente 00:03:08 -- fresco). Los datos que SI
+llegaron son utiles pero no concluyentes para el bug reportado:
+
+- El trio de fondo de HUD `(960x544 idx=1, 96x74 idx=2, 589x346 idx=7)` confirmado en consola: `overlap_max_area=203794`
+  para el panel grande -- coincide EXACTO con el area del propio panel de 589x346 (589*346=203794), o
+  sea, el "solapamiento" detectado es solo la superposicion ESPERADA entre los 3 elementos fijos del HUD
+  entre si (fondo general + marco de minimapa + vineta del mundo), consistente con capas de fondo
+  correctamente ordenadas, NO evidencia de un bug.
+- Un `loadFile: Save0.dat` (transicion de carga) genero, en el MISMO frame, un SEGUNDO fill de pantalla
+  completa (idx=133, `overlap_max_area=10608` ~= 102x104) y una secuencia de 6 apariciones de un panel de
+  ~102x100 (probablemente el cuadro de tip/loading) con `overlap_count` BAJANDO de 11 a 1 y `residual`
+  bajando de 62 a 1 a medida que pasan los frames -- un patron consistente con "fondo primero, texto
+  encima, cada vez menos cosas nuevas encima" -- **no muestra evidencia de que algo grande lo tape**, al
+  contrario de lo esperado por la hipotesis de la Fase 66.
+- **El evento real que el usuario pidio observar (recoger el objeto, "casi al final" del log) NO quedo
+  capturado**: el cupo de 60 lineas se agoto exactamente en la linea 911, en un panel fijo repetido
+  `(542,535,110,5)` (probablemente parte de la barra de vida/mana) que aparecia una y otra vez -- el MISMO
+  bug de agotamiento de cupo que ya paso en las Fases 63/64 con el otro diagnostico, esta vez en este.
+
+**Fix**: mismo patron que la Fase 64 -- dedupe por CONJUNTO de posiciones+tamanos (`x,y,w,h`) ya vistos
+(hasta 96 entradas) en vez de reloguear el mismo panel fijo cada frame; cada panel DISTINTO se reporta UNA
+sola vez (la primera vez que aparece), dejando el cupo libre para lo que aparezca despues de que el HUD
+fijo ya este "visto". Recompilado `--gpu-quads-test`. **Pendiente**: instalar, repetir la secuencia
+completa una vez mas (objeto en el suelo/recogerlo -- el evento que todavia no se capturo -- guardado
+in-game, guardado desde pausa para comparar), mandar el log.

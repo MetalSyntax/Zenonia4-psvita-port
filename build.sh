@@ -102,6 +102,46 @@ set -e
 #                                     confirmacion cualitativa de que los 3
 #                                     flags de perf conviven sin crashear.
 #                                     a la vez. Ahora tambien incluye INSTRUMENT_CGSGRAPHICS_CALLS=ON.
+#      ./build.sh --fastclear-neon-test -> (Fase 41, Tabla A #3) reemplaza
+#                                     CGsGraphics::FastClearNonClipping por una
+#                                     reimplementacion fiel (verificada contra
+#                                     su pseudo-C real en out_ghidra.c) que
+#                                     colapsa el loop de memset por fila en uno
+#                                     solo cuando el rectangulo es de ancho
+#                                     completo (FASTCLEAR_NEON_OPTIMIZE=ON),
+#                                     build/zenonia_4_fastclear_neon_test.vpk
+#                                     -- a diferencia de los demas hooks de
+#                                     este proyecto, ESTE reemplaza la funcion
+#                                     por completo (no hay unhook/llamar
+#                                     original/rehook), asi que el FPS medido
+#                                     con este build SI es comparable al
+#                                     normal. TODAVIA SIN MEDIR en consola real.
+#      ./build.sh --interlaced-test   -> (Fase 41, optimization_ideas.md #10,
+#                                     reinterpretado) sube solo filas
+#                                     pares/impares alternadas del framebuffer
+#                                     RGB565 por frame en vez del buffer
+#                                     completo (INTERLACED_UPLOAD=ON, requiere
+#                                     RGB565_DIRECT_UPLOAD=ON, mutuamente
+#                                     excluyente con DIRTY_RECT_UPLOAD),
+#                                     build/zenonia_4_interlaced_test.vpk --
+#                                     ahorra la mitad de los BYTES subidos por
+#                                     diseno (a diferencia de dirty-rect, no
+#                                     depende de cuanto cambio realmente), pero
+#                                     a costa de height/2 llamadas a
+#                                     glTexSubImage2D en vez de 1 sola -- ver
+#                                     avg_interlaced_pct_uploaded del log (debe
+#                                     rondar 50%) y comparar el FPS resultante
+#                                     contra el build normal antes de sacar
+#                                     conclusiones (el overhead por-llamada de
+#                                     esta vitaGL podria dominar sobre el
+#                                     ahorro de bytes).
+#      NOTA (Fase 41): la idea #3 de optimization_ideas.md (PBO/DMA async) NO
+#      tiene build de prueba -- se descarto con una inspeccion directa de
+#      vitaGL.h (~/vitasdk/arm-vita-eabi/include/vitaGL.h): GL_PIXEL_UNPACK_BUFFER
+#      no esta definido, solo GL_ARRAY_BUFFER/GL_ELEMENT_ARRAY_BUFFER -- sin ese
+#      target, glTexSubImage2D no tiene forma de leer de un buffer mapeado
+#      (pasar pixels=NULL seria una dereferencia de NULL garantizada, no un
+#      experimento real). Ver port_progress.md Fase 41 para el detalle.
 # Bug real encontrado en la Fase 32 (port_progress.md): como los flags de
 # diagnostico son opciones de CACHE de CMake, invocar este script con un modo
 # y despues con otro EN EL MISMO BUILD_DIR (siempre /tmp/zenonia4-build) hacia
@@ -113,34 +153,68 @@ set -e
 # extendido a NEON_LIBC_INTERCEPT/DISABLE_VSYNC/DIRTY_RECT_UPLOAD/
 # INSTRUMENT_CGSGRAPHICS_CALLS al agregarlos.
 VPK_OUTPUT_NAME="zenonia_4"
-CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 if [ "$1" = "--neon-fallback" ]; then
     VPK_OUTPUT_NAME="zenonia_4_neonfallback"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--drawnative-probe" ]; then
     VPK_OUTPUT_NAME="zenonia_4_drawnative_probe"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=ON -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=ON -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--hotpath-probe" ]; then
     VPK_OUTPUT_NAME="zenonia_4_hotpath_probe"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=ON -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=ON -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--neon-libc-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_neonlibc_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--no-vsync-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_novsync_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--neon-novsync-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_neonnovsync_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--dirtyrect-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_dirtyrect_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=ON -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=ON -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--cgsgraphics-probe" ]; then
     VPK_OUTPUT_NAME="zenonia_4_cgsgraphics_probe"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=ON)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=ON -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
 elif [ "$1" = "--all-perf-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_allperf_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=ON -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=ON -DINSTRUMENT_CGSGRAPHICS_CALLS=ON)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=ON -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=ON -DINSTRUMENT_CGSGRAPHICS_CALLS=ON -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
+elif [ "$1" = "--fastclear-neon-test" ]; then
+    VPK_OUTPUT_NAME="zenonia_4_fastclear_neon_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF)
+elif [ "$1" = "--interlaced-test" ]; then
+    VPK_OUTPUT_NAME="zenonia_4_interlaced_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=ON)
+elif [ "$1" = "--sprite-decode-test" ]; then
+    VPK_OUTPUT_NAME="zenonia_4_sprite_decode_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=ON -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF)
+elif [ "$1" = "--skip-blit-test" ]; then
+    # Variante 1: techo de FPS (PutCompressImg no-op). Ver CMakeLists SKIP_SPRITE_BLIT.
+    VPK_OUTPUT_NAME="zenonia_4_skip_blit_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DSKIP_SPRITE_BLIT=ON)
+elif [ "$1" = "--gpu-quads-test" ]; then
+    # Variante 2: sprites COPY -> quads GPU. Ver CMakeLists GPU_QUADS / loader/gpu_quads.c.
+    VPK_OUTPUT_NAME="zenonia_4_gpu_quads_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DGPU_QUADS=ON)
+elif [ "$1" = "--downsample-test" ]; then
+    # Variante 3: resolucion interna reducida (2/3 por defecto) + upscale GPU.
+    # OJO: zoomea la vista (el motor fusiona FOV y resolucion). Ratio ajustable
+    # con DS_NUM/DS_DEN, p.ej. --downsample-test 3 4  -> 3/4 (zoom mas leve).
+    VPK_OUTPUT_NAME="zenonia_4_downsample_test"
+    DS_N="${2:-2}"; DS_D="${3:-3}"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DDOWNSAMPLE_RENDER=ON -DDS_NUM="$DS_N" -DDS_DEN="$DS_D")
+elif [ "$1" = "--primitives-opt-test" ]; then
+    # Variante 4: optimizacion de primitivas / ancho de banda de memoria --
+    # combina las dos optimizaciones YA verificadas-seguras del proyecto:
+    # FastClearNonClipping reimplementado (FASTCLEAR_NEON_OPTIMIZE, Fase 41) +
+    # memcpy/memset NEON (NEON_LIBC_INTERCEPT, #4). Las ~13 primitivas restantes
+    # de CGsGraphics pasan por RGBBlend16 (alpha per-pixel sin confirmar) y no se
+    # pueden reimplementar sin riesgo hasta medir cual domina (--cgsgraphics-probe)
+    # y reversear ese path -- ver optimization_ideas.md.
+    VPK_OUTPUT_NAME="zenonia_4_primitives_opt_test"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DFASTCLEAR_NEON_OPTIMIZE=ON -DNEON_LIBC_INTERCEPT=ON)
 fi
 
 # Configuracion
@@ -187,8 +261,21 @@ fi
 echo "[2/4] Ejecutando CMake y Make..."
 cd "$BUILD_DIR"
 
+# cmake instalado como binario prebuilt sin sudo (ver $HOME/tools) en la maquina
+# WSL de desarrollo -- inofensivo en otras maquinas donde cmake ya este en PATH.
+export PATH="$HOME/tools:$PATH"
+
+# Los flags de perf/diagnostico son opciones de CACHE de CMake. Los branches de
+# arriba pasan explicitamente TODOS los flags historicos, pero los flags nuevos
+# (SKIP_SPRITE_BLIT / GPU_QUADS / DOWNSAMPLE_RENDER, agregados 2026-07-19) no
+# estan en los branches viejos -- borrar el cache antes de configurar evita que
+# queden "pegados" del valor de una corrida anterior con otro modo (mismo bug de
+# stickiness documentado en la Fase 32, resuelto aca de raiz para no tener que
+# enumerar cada flag nuevo en los ~13 branches).
+rm -f "$BUILD_DIR/CMakeCache.txt"
+
 cmake "$SRC_DIR" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA_ARGS[@]}"
-make -j$(sysctl -n hw.ncpu)
+make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 echo "[3/4] Exportando archivos generados..."
 mkdir -p "$PROJECT_DIR/build"
@@ -197,3 +284,4 @@ echo "VPK generado en: $PROJECT_DIR/build/$VPK_NAME"
 
 echo "[4/4] Deploy / instalacion (opcional)"
 echo "Para instalar en un Vita real o Vita3K, usar manage_vita.py."
+

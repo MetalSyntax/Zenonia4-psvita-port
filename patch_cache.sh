@@ -1,0 +1,3 @@
+sed -i 's/int gpu_quads_lookup_and_enqueue(const void \*data, const void \*pal, int op, int p8, int x, int y)/int gpu_quads_lookup_and_enqueue(const void *data, const void *pal, int op, int p8, int x, int y, int w, int h)/g' /mnt/e/PSVITA\ Develop/Zenonia4-vita/loader/gpu_quads.h
+sed -i 's/int gpu_quads_lookup_and_enqueue(const void \*data, const void \*pal, int op, int p8, int x, int y)/int gpu_quads_lookup_and_enqueue(const void *data, const void *pal, int op, int p8, int x, int y, int w, int h)/g' /mnt/e/PSVITA\ Develop/Zenonia4-vita/loader/gpu_quads.c
+sed -i 's/gpu_quads_lookup_and_enqueue(p5, p6, op, p8, p1, p2)/gpu_quads_lookup_and_enqueue(p5, p6, op, p8, p1, p2, p3, p4)/g' /mnt/e/PSVITA\ Develop/Zenonia4-vita/loader/dynlib.c

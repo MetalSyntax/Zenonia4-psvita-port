@@ -28,6 +28,13 @@
 #include "so_util.h"
 #include "audio.h"
 #include "androidui.h"
+
+// Override vitaGL splash screen (strong symbol overrides the one in libvitaGL.a)
+void invoke_splashscreen(void) {}
+
+#ifdef ZENONIA_GPU_QUADS
+#include "gpu_quads.h"
+#endif
 #include <taihen.h>
 #include <vitaGL.h>
 #include <falso_jni/FalsoJNI.h>
@@ -55,10 +62,42 @@
 // tampoco ayuda fingir un viewport mas chico (no ataca el costo real) -- se
 // abandono el enfoque de "bajar resolucion" por completo. La ganancia de
 // framerate se busca ahora en scePowerSet*ClockFrequency (gl_init()).
+#ifdef ZENONIA_DOWNSAMPLE
+// Variante 3 (--downsample-test): resolucion INTERNA reducida.
+//
+// Advertencia honesta (verificada en el codigo decompilado, no teoria): este
+// motor NO separa "campo de vision" de "resolucion" -- la camara muestra
+// exactamente deviceW x deviceH pixeles de mundo, dibujados 1:1, y el blitter
+// EXIGE buffer==deviceInfo (ver out_ghidra.c: posiciones absolutas, stride del
+// struct global de screen buffer, sin factor de escala mundo->pantalla, ni zoom
+// de camara). Por eso bajar la resolucion interna necesariamente ZOOMEA la
+// vista (se ve menos mundo, magnificado), como ya observo el usuario en los 4
+// intentos previos (main.c historico / port_progress.md Fases 16-21). Esta
+// variante NO resuelve eso -- lo reproduce a un ratio configurable y suave, y
+// deja que vitaGL haga el upscale bilinear a 960x544 en GPU (el unico aporte
+// nuevo vs los intentos previos). Sirve para que el usuario juzgue en consola
+// si un zoom mas leve + suavizado por GPU es un tradeoff aceptable de FPS.
+//
+// El AHORRO real de CPU es proporcional: a NUM/DEN=2/3 el motor rasteriza
+// (2/3)^2 = ~44% de los pixeles -> ~56% menos trabajo de blit por software.
+// Todo lo demas (touch, androidui, ortho) cascadea solo porque ya se calcula
+// en terminos de GAME_W/SCREEN_W (ver la conversion de touch mas abajo).
+#ifndef ZENONIA_DS_NUM
+#define ZENONIA_DS_NUM 2
+#endif
+#ifndef ZENONIA_DS_DEN
+#define ZENONIA_DS_DEN 3
+#endif
+#define GAME_W ((960 * ZENONIA_DS_NUM) / ZENONIA_DS_DEN)
+#define GAME_H ((544 * ZENONIA_DS_NUM) / ZENONIA_DS_DEN)
+#define SCREEN_W GAME_W
+#define SCREEN_H GAME_H
+#else
 #define GAME_W 960
 #define GAME_H 544
 #define SCREEN_W 960
 #define SCREEN_H 544
+#endif
 
 FILE *log_file = NULL;
 
@@ -96,7 +135,7 @@ void game_log(const char *fmt, ...) {
 
     if (log_file) {
         fprintf(log_file, "%s", string);
-        fflush(log_file);
+        // fflush(log_file); // ELIMINADO: esto causa un cuello de botella de I/O brutal (10 FPS)
     }
 }
 
@@ -244,11 +283,23 @@ extern volatile unsigned int g_putcompressimg_calls_this_frame;
 extern volatile unsigned int g_cgsgraphics_calls_this_frame;
 extern volatile unsigned int g_dirtyrect_rows_uploaded_this_frame;
 extern volatile unsigned int g_dirtyrect_rows_total_this_frame;
+extern volatile unsigned int g_interlaced_rows_uploaded_this_frame;
+extern volatile unsigned int g_interlaced_rows_total_this_frame;
+extern volatile unsigned int g_gpu_quads_calls_this_frame;
+extern volatile unsigned int g_gpu_quads_op0_calls_this_frame;
+extern volatile unsigned int g_gpu_quads_cache_hit_this_frame;
+extern volatile unsigned int g_gpu_quads_decoded_this_frame;
 extern void zenonia_install_array_hooks(void);
 extern void zenonia_install_hide_dpad_hook(so_module *mod);
 extern void zenonia_install_drawnative_probe(so_module *mod);
 extern void zenonia_install_hotpath_probe(so_module *mod);
+#ifdef ZENONIA_GPU_QUADS
+extern void zenonia_install_text_quads_hook(so_module *mod);
+extern void zenonia_install_screen_fill_quads_hook(so_module *mod);
+#endif
 extern void zenonia_install_cgsgraphics_probe(so_module *mod);
+extern void zenonia_install_fastclear_optimize(so_module *mod);
+extern void zenonia_install_sprite_decode_optimize(so_module *mod);
 
 static GLuint splash_tex = 0;
 
@@ -462,6 +513,12 @@ int main() {
 		zenonia_install_drawnative_probe(&zenonia4_mod); // ver dynlib.c -- Fase 29, cuenta llamadas a DrawNative (INSTRUMENT_DRAWNATIVE_CALLS)
 		zenonia_install_hotpath_probe(&zenonia4_mod); // ver dynlib.c -- Fase 31, cuenta CGxPZxAni::Draw/CGxPZxZero::Blt/PutCompressImg (INSTRUMENT_HOTPATH_CALLS)
 		zenonia_install_cgsgraphics_probe(&zenonia4_mod); // ver dynlib.c -- Fase 36, cuenta ~13 primitivas de CGsGraphics:: (INSTRUMENT_CGSGRAPHICS_CALLS)
+		zenonia_install_fastclear_optimize(&zenonia4_mod); // ver dynlib.c -- Fase 41, reimplementacion real (no solo conteo) de FastClearNonClipping (FASTCLEAR_NEON_OPTIMIZE)
+		zenonia_install_sprite_decode_optimize(&zenonia4_mod); // ver sprite_decode.c -- Fase 43, reemplaza RLE ASM por C nativo
+#ifdef ZENONIA_GPU_QUADS
+		zenonia_install_text_quads_hook(&zenonia4_mod); // ver dynlib.c -- Fase 59, desvia CGxFACharCache::DrawToFrameBuffer (texto) a la misma cola de quads que los sprites
+		zenonia_install_screen_fill_quads_hook(&zenonia4_mod); // ver dynlib.c -- Fase 61, desvia Screen_RGBBLEND16_Real (rellenos solidos con alpha) a la misma cola de quads
+#endif
 
 		game_log("Symbols: JNI_OnLoad=%p NativeInitDeviceInfo=%p NativeInitWithBufferSize=%p NativeRender=%p NativeResize=%p NativeResumeClet=%p handleCletEvent=%p\n",
 			(void*)Game_JNI_OnLoad, (void*)NativeInitDeviceInfo, (void*)NativeInitWithBufferSize,
@@ -499,6 +556,13 @@ int main() {
 
 		game_log("Iniciando Bucle Principal...\n");
 
+#ifdef ZENONIA_GPU_QUADS
+		// Variante 2: preparar el offload de sprites a GPU (scratch + cache).
+		// Las coordenadas de los quads van en el espacio logico de pantalla del
+		// motor (= SCREEN_W/H, que ya cascadea con downsample si se combinaran).
+		gpu_quads_init(SCREEN_W, SCREEN_H);
+#endif
+
 		sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
 
 		SceCtrlData pad;
@@ -516,6 +580,12 @@ int main() {
 		unsigned int cgsgraphics_calls_accum = 0;
 		unsigned int dirtyrect_rows_uploaded_accum = 0;
 		unsigned int dirtyrect_rows_total_accum = 0;
+		unsigned int interlaced_rows_uploaded_accum = 0;
+		unsigned int interlaced_rows_total_accum = 0;
+		unsigned int gpu_quads_calls_accum = 0;
+		unsigned int gpu_quads_op0_calls_accum = 0;
+		unsigned int gpu_quads_cache_hit_accum = 0;
+		unsigned int gpu_quads_decoded_accum = 0;
 
 		while (1) {
 			sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -571,8 +641,32 @@ int main() {
 					? (100.0f * dirtyrect_rows_uploaded_accum / dirtyrect_rows_total_accum) : 0.0f;
 				dirtyrect_rows_uploaded_accum = 0;
 				dirtyrect_rows_total_accum = 0;
-				game_log("frame %d alive, fps=%.1f avg_rgb565_uploads_per_frame=%.1f avg_drawnative_calls_per_frame=%.1f avg_cgxpzxani_draw_per_frame=%.1f avg_cgxpzxzero_blt_per_frame=%.1f avg_putcompressimg_per_frame=%.1f avg_cgsgraphics_per_frame=%.1f avg_dirtyrect_pct_uploaded=%.1f touch.reportNum=%d pad.buttons=0x%08x ui_status=%d\n",
-					frame, fps, avg_uploads, avg_drawnative, avg_ani_draw, avg_zero_blt, avg_putcompress, avg_cgsgraphics, avg_dirtyrect_pct, touch.reportNum, (unsigned int) pad.buttons, g_ui_status);
+				// Fase 41: porcentaje de filas del framebuffer RGB565
+				// realmente subidas via INTERLACED_UPLOAD (ver dynlib.c) --
+				// deberia rondar 50% por diseno (alterna pares/impares
+				// cada frame), a diferencia de avg_dirtyrect_pct que
+				// depende de cuanto cambio realmente. 0.0/sin filas
+				// totales siempre en el build normal.
+				float avg_interlaced_pct = interlaced_rows_total_accum > 0
+					? (100.0f * interlaced_rows_uploaded_accum / interlaced_rows_total_accum) : 0.0f;
+				interlaced_rows_uploaded_accum = 0;
+				interlaced_rows_total_accum = 0;
+				// Fase 48: promedio por frame de llamadas a PutCompressImg vistas
+				// por el hook de GPU_QUADS (siempre activo en ese build, a
+				// diferencia de avg_putcompressimg_per_frame que depende de
+				// INSTRUMENT_HOTPATH_CALLS) -- cuantas son op==0 (candidatas a
+				// offload), cuantas de esas pegaron en cache vs. se decodificaron
+				// de nuevo. 0.0 siempre en builds sin GPU_QUADS.
+				float avg_gpu_quads_calls = gpu_quads_calls_accum / 120.0f;
+				float avg_gpu_quads_op0 = gpu_quads_op0_calls_accum / 120.0f;
+				float avg_gpu_quads_hit = gpu_quads_cache_hit_accum / 120.0f;
+				float avg_gpu_quads_decoded = gpu_quads_decoded_accum / 120.0f;
+				gpu_quads_calls_accum = 0;
+				gpu_quads_op0_calls_accum = 0;
+				gpu_quads_cache_hit_accum = 0;
+				gpu_quads_decoded_accum = 0;
+				game_log("frame %d alive, fps=%.1f avg_rgb565_uploads_per_frame=%.1f avg_drawnative_calls_per_frame=%.1f avg_cgxpzxani_draw_per_frame=%.1f avg_cgxpzxzero_blt_per_frame=%.1f avg_putcompressimg_per_frame=%.1f avg_cgsgraphics_per_frame=%.1f avg_dirtyrect_pct_uploaded=%.1f avg_interlaced_pct_uploaded=%.1f avg_gpu_quads_calls_per_frame=%.1f avg_gpu_quads_op0_per_frame=%.1f avg_gpu_quads_hit_per_frame=%.1f avg_gpu_quads_decoded_per_frame=%.1f touch.reportNum=%d pad.buttons=0x%08x ui_status=%d\n",
+					frame, fps, avg_uploads, avg_drawnative, avg_ani_draw, avg_zero_blt, avg_putcompress, avg_cgsgraphics, avg_dirtyrect_pct, avg_interlaced_pct, avg_gpu_quads_calls, avg_gpu_quads_op0, avg_gpu_quads_hit, avg_gpu_quads_decoded, touch.reportNum, (unsigned int) pad.buttons, g_ui_status);
 			}
 
 			// Salida de emergencia: START+SELECT juntos
@@ -743,6 +837,11 @@ int main() {
 				handleCletEvent(jniEnv, NULL, ev->type, ev->p1, ev->p2, ev->p3);
 			}
 
+#ifdef ZENONIA_GPU_QUADS
+			// Variante 2 (Fase 50): los quads se dibujan en glDrawArrays_wrapper
+			// (dynlib.c), justo despues del draw del FB base del motor -- aca no
+			// hay nada que hacer.
+#endif
 			if (NativeRender) NativeRender(jniEnv, NULL);
 			rgb565_upload_accum += g_rgb565_uploads_this_frame;
 			g_rgb565_uploads_this_frame = 0;
@@ -760,6 +859,19 @@ int main() {
 			dirtyrect_rows_total_accum += g_dirtyrect_rows_total_this_frame;
 			g_dirtyrect_rows_uploaded_this_frame = 0;
 			g_dirtyrect_rows_total_this_frame = 0;
+			interlaced_rows_uploaded_accum += g_interlaced_rows_uploaded_this_frame;
+			interlaced_rows_total_accum += g_interlaced_rows_total_this_frame;
+			g_interlaced_rows_uploaded_this_frame = 0;
+			g_interlaced_rows_total_this_frame = 0;
+
+			gpu_quads_calls_accum += g_gpu_quads_calls_this_frame;
+			g_gpu_quads_calls_this_frame = 0;
+			gpu_quads_op0_calls_accum += g_gpu_quads_op0_calls_this_frame;
+			g_gpu_quads_op0_calls_this_frame = 0;
+			gpu_quads_cache_hit_accum += g_gpu_quads_cache_hit_this_frame;
+			g_gpu_quads_cache_hit_this_frame = 0;
+			gpu_quads_decoded_accum += g_gpu_quads_decoded_this_frame;
+			g_gpu_quads_decoded_this_frame = 0;
 
 			// Mientras el motor este en logo/titulo (estados de UI de Java,
 			// invisibles en el loader nativo -- pendiente confirmar los
@@ -776,6 +888,10 @@ int main() {
 			androidui_draw(g_ui_status, SCREEN_W, SCREEN_H);
 
 			vglSwapBuffers(GL_FALSE);
+#ifndef ZENONIA_DISABLE_VSYNC
+            // Forzar limite a 30 FPS (esperar un vblank extra, ya que vglSwapBuffers espera el primero)
+            sceDisplayWaitVblankStart();
+#endif
 		}
 	}
 

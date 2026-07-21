@@ -24,6 +24,8 @@
 /Makefile
 /cmake_install.cmake
 /build/
+__pycache__/
+*.pyc
 
 # IDE files
 .vscode/

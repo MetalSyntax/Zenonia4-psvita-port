@@ -2,234 +2,218 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**This file describes the CURRENT, ACTIVE state of the port** (updated 2026-07-21, up through
+`port_progress.md` Fase 68). For the full phase-by-phase history of every bug found/fixed and every
+build variant tried, `port_progress.md` is authoritative — this file is an orientation map, not a
+replacement for it.
+
 ## What this repository is
 
-This is a **PS Vita port project for Zenonia 4** (Android package `com.gamevil.zenonia4.global`,
+This is a **working PS Vita port of Zenonia 4** (Android package `com.gamevil.zenonia4.global`,
 version 1.2.3), using the **soloader** approach: a native Vita executable that loads the Android
 `.so` directly (no recompilation), resolves its imports against a homemade libc/EGL/pthread/etc.
-implementation, and emulates JNI with FalsoJNI.
+implementation, and emulates JNI with FalsoJNI. The game **boots, plays, saves/loads, and the story
+progresses** — this is well past the "does it even start" stage; current work is fixing GPU-rendering
+correctness/performance regressions in an experimental rendering variant (see "Where things stand" below).
+
+**Engine confirmed** (via `nm -D`/Ghidra, not assumed): Gamevil's own in-house engine, **not** cocos2d-x.
+Native entry points are under `Java_com_gamevil_nexus2_Natives_*`; internal C++ classes use `CGs*`
+(Gamevil System), `CMv*`, `CZn*` (Zenonia-specific), and `GVUI*` (a separate generic Gamevil UI library)
+prefixes.
 
 Layout:
 
-- `source/`, `lib/`, `extras/`, `CMakeLists.txt` — the actual Vita soloader project (see
-  "Architecture" below). **Currently this is the unmodified upstream boilerplate** — no Zenonia-4
-  specific code has been written yet (no references to the game, `gamename` placeholders still in
-  `CMakeLists.txt`, `main.c`'s render loop is just `// ... do some initialization` /
-  `// ... render call` comments). This is the actual starting point for implementation work.
+- **`loader/` — the ACTIVE soloader source, this is what you edit.** Forked from the `Zenonia3-vita`
+  project's `loader/` lineage (same Nexus2/Clet engine as Zenonia 2/3, confirmed by symbol comparison),
+  not written from scratch. Key files: `main.c` (boot sequence + render loop), `dynlib.c` (import
+  resolution + the bulk of runtime hooks — GL wrappers, `PutCompressImg`/`RGBBlend16`/
+  `DrawNativeFillEllipse` hooks, hide-dpad hook), `java.c` (FalsoJNI method tables + GFA font bridge),
+  `gpu_quads.c`/`.h` (the GPU-quads rendering pipeline, see below), `sprite_decode.c`/`.h` (native RLE
+  sprite decoder), `font.c`/`.h` (stb_truetype-backed GFA font rasterizer), `audio.c` (Tremor/OGG
+  mixer), `androidui.c` (legacy Android-UI overlay bridge — mostly unused, see Fase 14), `htmltext.c`/
+  `htmlview.c` (in-app HTML help/about viewer), `so_util.c`/`.h` (the ELF loader + inline hooking,
+  vendored but game-agnostic), `neon_mem.c` (NEON memcpy/memset, opt-in).
+- **`source/`, `extras/` — the ORIGINAL generic soloader boilerplate, abandoned and unused (Fase 2).**
+  Still present in the tree in case something in it is worth salvaging, but zero lines of it are
+  compiled into the current build. Do not treat it as the starting point — `loader/` is.
+- `common/` — `debugScreen.c` (on-screen `debugScreenPrintf()`, vendored).
+- `lib/` — vendored support libs: `falso_jni/` (FalsoJNI), `fios/`, `sha1/`, `stb/` (stb_truetype),
+  `so_util/` (older copy, superseded by `loader/so_util.c`), `libc_bridge/` (a separate CMake
+  subproject building `SceLibcBridge`, used when `USE_SCELIBC_IO` is on), `kubridge/` (prebuilt kernel
+  bridge stub libs). Also holds `libgameDSO.so` itself (symlinked/copied from the extracted APK) —
+  the actual game binary the loader loads at runtime.
 - `zenonia-4-1-2-3/` — the extracted original APK (decompiled resources, not source you edit) —
-  reference material for Fase 1-style analysis (`nm`, `strings`, jadx).
-- `porting_tools/` — build/deploy/decompile/automation scripts **reused from earlier, different
-  ports** (Dungeon Hunter 2, Prince of Persia Classic). Templates, not ready-to-run — see "Adapting
-  `porting_tools/`" below before running any of them.
-- `psvita-port-toolkit/` — a generic, game-agnostic porting guide and a Claude Code skill
-  (`skills/psvita-porting/`) distilled from those earlier ports.
+  reference material for `nm`/`strings`/jadx analysis.
+- `decompiled/` — `apk_jadx/` (jadx decompile of the Java side) and
+  `libgameDSO_armeabi/ghidra/out_ghidra.c` (Ghidra decompile of the native engine, ~7MB — **the
+  primary source of truth for "how does the engine actually do X"**, used throughout the GPU_QUADS
+  investigation to find real function names/signatures instead of guessing).
+- `ux0_data/` — local staging mirror of what goes on the Vita's memory card under `ux0:data/`
+  (symlinked assets + sound files), used by `manage_vita.py`/deploy scripts.
+- `porting_tools/` — build/deploy/decompile/automation scripts. `build_and_install.sh` and
+  `manage_vita.py` have been adapted for this project specifically (see "porting_tools" below); the
+  rest are still templates reused from earlier, different ports (Dungeon Hunter 2, Prince of Persia
+  Classic) — read before running.
+- `psvita-port-toolkit/` — a generic, game-agnostic porting guide and Claude Code skill
+  (`skills/psvita-porting/`) distilled from those earlier ports. Written for cocos2d-x engines —
+  Zenonia 4 is not cocos2d-x, so treat its phase structure as generically applicable but verify any
+  concrete symbol name against this binary, not the guide's examples.
+- `port_progress.md` — **the authoritative, chronological log of this port**, from Fase 0 (planning)
+  through the current GPU-rendering arc (Fase 43+). Every real bug found, every hypothesis tried and
+  confirmed/refuted, every build variant measured. Read the tail of it before assuming something is
+  broken/unfixed — it may already be documented there.
+- `gpu_rendering_log.md` — an earlier, narrative (Spanish, non-technical-audience) summary of the
+  GPU-quads rendering work through roughly Fase 55. **Superseded by `port_progress.md`'s later
+  phases** (Fase 56+ found and corrected real inaccuracies in it — e.g. it claims a "solución
+  definitiva" that later phases showed still had open bugs). Kept for context but don't treat its
+  conclusions as current status.
+- `optimization_ideas.md`, `plan_zenonia4_port.md` — planning documents from earlier phases, mostly
+  of historical interest now that the ideas in them have been tried (see `port_progress.md` for
+  results).
+
+## Where things stand (as of Fase 68)
+
+The port is playable end-to-end: boots, renders, takes touch input, plays audio, saves/loads. The
+current active development effort is **Variante 2, `--gpu-quads-test`**
+(`build/zenonia_4_gpu_quads_test.vpk`) — offloading the engine's software-rendered sprites to GPU
+quads via vitaGL for a real, measured FPS win, while chasing down graphical regressions the offload
+introduced. The recurring bug family in this arc: several engine draw paths (sprite blits, text
+glyphs, solid-color UI fills, rounded-rect corners) write **directly into the software framebuffer**,
+bypassing the one function (`PutCompressImg`) originally hooked to divert content to GPU quads — so
+anything using one of those paths gets visually buried under GPU-quad content drawn in the same frame,
+regardless of the engine's real intended order. Each instance found so far got the same fix: hook the
+real underlying function, convert its draw call into a quad, enqueue it into the *same* ordered quad
+queue as sprites. Confirmed instances: text (`CGxFACharCache::DrawToFrameBuffer`), solid alpha fills
+(`Screen_RGBBLEND16_Real`), rounded-corner fills (`DrawNativeFillEllipse`, gated to real rounded-rect
+corners only). **Still open**: an in-game-only variant of the missing-background bug (item pickup /
+save / tip dialogs during actual gameplay, as opposed to the pause menu, which works) whose exact cause
+is still being isolated via console-log diagnostics; map character/portal icons not rendering; a
+narrower text-cache-staleness report in one pause-menu popup. See `port_progress.md` Fase 63 onward for
+the detailed, current diagnosis-in-progress.
+
+Other build variants exist for performance experimentation (see `build.sh`'s own header comment for
+the full list with rationale): `--neon-fallback`, `--sprite-decode-test`, `--fastclear-neon-test`,
+`--downsample-test`, `--primitives-opt-test`, several `--*-probe`/`--*-test` diagnostic-only builds.
+The **default build** (`./build.sh`, no flag) is the stable baseline: `RGB565_DIRECT_UPLOAD=ON`
+(confirmed real FPS win, no color regressions), everything else off. GPU_QUADS is NOT on by default —
+it's an experimental variant, opt in via `--gpu-quads-test` explicitly.
 
 ## Build
 
-Requires the `VITASDK` env var (or `CMAKE_TOOLCHAIN_FILE`) pointing at a VitaSDK install.
+Requires the `VITASDK` env var pointing at a VitaSDK install (`-softfp` variant). Two ways to build:
 
-```sh
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug   # Debug enables -DDEBUG_SOLOADER logging
-make -j$(sysctl -n hw.ncpu)         # produces eboot.bin and so_loader.vpk (VITA_VPKNAME)
-```
+- **`./build.sh [flag]`** (repo root) — the real build script, handles the `/tmp` staging workaround
+  for the space in this repo's own path (`vita-pack-vpk` breaks on paths with spaces), sets every
+  CMake option explicitly per variant (cache-stickiness gotcha, see the script's own comments), and
+  copies the resulting `.vpk` to `build/`. Run with no argument for the default build
+  (`build/zenonia_4.vpk`), or a flag like `--gpu-quads-test` for a variant — see the script's header
+  comment for the full annotated list.
+- **`porting_tools/build/build_and_install.sh`** — interactive wrapper around `build.sh`: presents a
+  menu of every flag `build.sh` supports (parsed from `build.sh` itself, so it never goes stale),
+  optionally installs+launches in Vita3K on macOS afterward, and archives the unsigned ELF alongside
+  the VPK for `vita-parse-core` crash symbolization. Portable to macOS's stock bash 3.2.
 
-Useful `cmake -D` cache variables (all defined in `CMakeLists.txt`, currently at generic/placeholder
-values — see "What needs to change" below):
+Useful `cmake` options (all in `CMakeLists.txt`, normally set via `build.sh`'s per-flag argument
+lists, not passed directly): `ENABLE_VERBOSE_JNI_LOG`, `HIDE_VIRTUAL_GAMEPAD`, `RGB565_DIRECT_UPLOAD`
+(default ON), `GPU_QUADS`, `SPRITE_DECODE_OPTIMIZE`, `DOWNSAMPLE_RENDER` (+ `DS_NUM`/`DS_DEN`), and a
+handful of `INSTRUMENT_*`/diagnostic-only options — see the option() calls in `CMakeLists.txt` for the
+full list with descriptions (each documents its own rationale/status inline).
 
-- `DATA_PATH` — `ux0:data/<gamename>/`, where the game's `.so` and assets live on the memory card.
-- `SO_PATH` — defaults to `${DATA_PATH}main.so`; the actual filename to load (Zenonia 4's is
-  `libgameDSO.so`, not `main.so`).
-- `SHADER_FORMAT` — one of `GLSL` / `CG` / `GXP`.
-- `DUMP_COMPILED_SHADERS` — cache compiled shaders to disk (only meaningful for `GLSL`/`CG`).
-- `PSVITAIP` — console/emulator IP, used by the `send`/`send_kvdb`/`dump`/`reboot` custom targets.
-- `PARSECOREPATH` — path to `vita-parse-core`'s `main.py`, used by the `dump` target.
-- `USE_SCELIBC_IO` (default ON) — use `SceLibcBridge` (built from `lib/libc_bridge/`) for IO/libc.
+There is no separate lint step; `porting_tools/tests/run_tests.sh` is a *template* for a host-side
+pre-build test harness from a different, earlier port, not wired into this build.
 
-Custom build targets (require a running VitaShell FTP+command server on `PSVITAIP`, ports 1337/1338):
+### Deploying / getting logs off the console
 
-- `make send` — kills the running app, uploads `eboot.bin` via FTP, relaunches it.
-- `make send_kvdb` — same but launches via full path (for apps not yet registered/installed).
-- `make dump` — fetches the newest `.psp2dmp` from the console (`extras/scripts/get_dump.sh`) and
-  symbolizes it against the just-built ELF with `vita-parse-core`.
-- `make reboot` — reboots the console/emulator over the command port.
+`porting_tools/manage_vita.py` (menu-driven FTP tool, adapted for this project): option 1 now scans
+`build/` for every `.vpk` present and lets you choose which to upload (handles the multiple build
+variants above — no longer a single hardcoded path), option 2 downloads the newest crash dump + log
+from the console. Edit `VITA_IP`/`VITA_PORT`/`VITA_DATA_DIR` at the top if the console's address or
+data path changes.
 
-There is no separate lint step; `run_tests.sh` under `porting_tools/tests/` is a *template* for a
-host-side pre-build test harness (see below), not something wired into this CMake build.
+## Architecture (boot sequence)
 
-## Architecture
+`main()` (`loader/main.c`) drives, in order: load/relocate/resolve-imports/patch/flush-caches/init the
+`.so` (`loader/so_util.c` + `dynlib.c`), install runtime hooks (`zenonia_install_hide_dpad_hook`,
+`zenonia_install_hotpath_probe` — which also installs the always-on `PutCompressImg` crash guard and,
+under `GPU_QUADS`, the text/fill/ellipse quad hooks — `zenonia_install_cgsgraphics_probe`,
+`zenonia_install_fastclear_optimize`, `zenonia_install_sprite_decode_optimize`), `gl_preload()`/GL
+context setup, then manually call `JNI_OnLoad` followed by the engine's real native lifecycle entry
+points (`Java_com_gamevil_nexus2_Natives_NativeInitDeviceInfo`/`NativeInitWithBufferSize`/
+`NativeRender`/`NativeResize`/`NativeResumeClet`/`handleCletEvent` — resolved directly via `so_symbol`,
+not through the JNI table) before entering the render loop.
 
-The soloader itself (`source/` + `lib/`), executed in the order `main()` → `soloader_init_all()`
-(`source/utils/init.c`) drives:
+`loader/java.c` sets up FalsoJNI's method tables (name → ID, ID → implementation) that both
+`resolve_imports` and the manually-resolved native entry points call back into for "Java"-side
+behavior — this is where the GFA (font) bridge lives (`Zenonia_GFA_*`, backed by `loader/font.c`'s
+stb_truetype rasterizer), along with save/load, device-info getters, and Tapjoy/IAB/analytics no-ops.
 
-1. `fios_init` (`lib/fios/`) — sets up FIOS2 so the loaded `.so` can do file IO against `DATA_PATH`.
-2. Sanity checks: `kubridge` loaded, `SO_PATH` exists on the memory card — both `fatal_error()` out
-   with an explicit on-screen message rather than silently crashing.
-3. `so_file_load` / `so_relocate` / `resolve_imports` / `so_patch` / `so_flush_caches` /
-   `so_initialize` (`lib/so_util/so_util.c` + `source/dynlib.c` + `source/patch.c`) — the actual ELF
-   loader: loads the `.so` at `LOAD_ADDRESS` (`0x98000000`, `source/utils/init.c`), relocates it,
-   resolves its imported symbols against the `dynlib` table in `source/dynlib.c` (the big file,
-   ~1000 lines — this is where most libc/pthread/GL/etc. stub wiring for a new game gets added),
-   applies any hand-written binary patches (`source/patch.c`, currently a no-op stub), flushes
-   caches, then calls the module's init/constructors.
-4. `gl_preload()` (`source/utils/glutil.c`) then, back in `main()`, `JNI_OnLoad(&jvm)` is called
-   manually and `gl_init()`/`gl_swap()` drive the render loop — `main()` itself is currently just the
-   boilerplate skeleton and needs the actual per-game native entry-point calls (`nativeInit`,
-   `nativeRender`, etc. — named differently in this game, see "This game's specifics" below) added
-   after `JNI_OnLoad`.
-5. `jni_init()` (`source/java.c`, using `lib/falso_jni/`) sets up the fake `JavaVM`/`JNIEnv` that
-   `resolve_imports` and the manually-resolved native entry points call into; FalsoJNI's method
-   tables (name → ID, ID → implementation) are where JNI callback stubs for this game will need to be
-   registered per Fase 3 of the porting guide.
-
-Supporting pieces:
-
-- `source/reimpl/` — from-scratch reimplementations of the bits of Bionic libc/pthread/EGL/mem/
-  errno/time64/sys that the loaded `.so` needs and that VitaSDK's own libc doesn't provide
-  compatibly, plus `asset_manager.cpp` (Android's `AAssetManager` JNI-facing surface — this is
-  usually where the asset-packaging decision from Fase 5 of the porting guide gets implemented).
-- `source/utils/` — `init.c` (above), `glutil.c` (GL context/shader setup, vitaGL), `dialog.c`
-  (on-screen native error dialogs — `fatal_error()`), `settings.c`/`settings.h` (loader settings
-  persisted for a separate `configurator.bin` app, launched via a LiveArea `-config` boot param —
-  currently only sample placeholder settings), `logger.c` (file logging, one log per run — the
-  workflow described in Fase 6 of the porting guide), `utils.c` (misc helpers e.g. `file_exists`,
-  `module_loaded`).
-- `lib/so_util/` — the ELF loader itself (vendored, not game-specific).
-- `lib/falso_jni/` — FalsoJNI (vendored).
-- `lib/fios/`, `lib/sha1/` — vendored support libs.
-- `lib/libc_bridge/` — a separate CMake subproject (`add_subdirectory`) building `SceLibcBridge`, a
-  stub library bridging to Sony's own libc for functions `USE_SCELIBC_IO` routes through; has its own
-  `nids.yml`.
-- `lib/kubridge/` — prebuilt kubridge stub libs (`.a`), not source.
-- `extras/livearea/` — the 4 required LiveArea PNGs + `template.xml`, baked into the `.vpk` by
-  `vita_create_vpk()` in `CMakeLists.txt`. Currently generic/placeholder art — replace with Zenonia 4
-  branding when ready (must stay 8-bit indexed PNGs at exact sizes, per Fase 8 of the porting guide).
-- `extras/cpuinfo`, `extras/meminfo` — also baked into the `.vpk` root.
-- `extras/scripts/get_dump.sh` — used by the `make dump` CMake target; a duplicate of
-  `porting_tools/misc/get_dump.sh` (both fetch the newest `.psp2dmp` over FTP) — keep them in sync or
-  dedupe if one is edited.
-
-## What needs to change from the boilerplate for Zenonia 4
-
-None of this has been done yet — it's the actual next-step work list, derived from cross-referencing
-the CMake/source boilerplate against the confirmed facts in "This game's specifics":
-
-- `CMakeLists.txt`: `VITA_TITLEID`, `VITA_APP_NAME`, `DATA_PATH` (`ux0:data/gamename/` →
-  something under `ux0:data/`), `SO_PATH` (must resolve to `libgameDSO.so`, not `main.so`),
-  `PSVITAIP` default.
-- `source/main.c`: after `JNI_OnLoad`, add the real native lifecycle calls — but this game's engine
-  is Gamevil's own (see below), so its native entry points are named `Java_com_gamevil_nexus2_
-  Natives_NativeInitWithBufferSize`/`NativeRender`/`NativeResize`/etc., not the cocos2d-x-style names
-  the porting guide's examples use.
-- `source/dynlib.c`: populate/extend the import-resolution table for whatever `libgameDSO.so`
-  actually imports (confirm with `nm -D --undefined-only` on that `.so`, don't assume it matches a
-  prior port's table).
-- `source/java.c` / FalsoJNI tables: register the `Natives_*` methods and work out which JNI
-  callbacks the engine calls back into "Java" for (Tapjoy ads, GCM push are strong no-op candidates —
-  see below) — following the no-op-vs-must-fire-callback distinction in Fase 3 of the porting guide.
-- `source/reimpl/asset_manager.cpp`: implement against Zenonia 4's actual asset layout (`.zt1`/`.pzx`
-  proprietary formats, no `.obb` — see below) once the path-resolution semantics are confirmed
-  experimentally.
-- `extras/livearea/*`, `template.xml`: replace placeholder art/metadata with Zenonia 4's.
-
-## Where to look for the porting methodology
-
-Do not re-derive the soloader architecture from scratch — it's already documented:
-
-- **`psvita-port-toolkit/PORTING_GUIDE.md`** — phase-by-phase guide (toolchain → APK analysis →
-  loader → FalsoJNI → graphics → assets → hardware debugging → input → VPK packaging → checklist).
-  Read this first for the overall plan.
-- **`psvita-port-toolkit/skills/psvita-porting/references/*.md`** — deep technical detail per topic
-  (`so_loading.md`, `jni_bindings.md`, `jni_stubs.md`, `input_handling.md`, `asset_packaging.md`,
-  `hardware_debugging.md`, `vpk_packaging.md`, `vitasdk_setup.md`, `toolchain_gotchas.md`, etc.). The
-  `psvita-porting` skill surfaces these automatically for porting/crash-triage work.
-- The `so-crash-triage` skill is the methodology to use for diagnosing a crash from a console log +
-  `.psp2dmp`, cross-referencing the real `.so`, its Ghidra pseudo-C, and the jadx-decompiled Java —
-  rather than guessing.
-
-**Important caveat:** the guide and skill were distilled from **cocos2d-x** ports. Zenonia 4 does
-**not** use cocos2d-x — see below. Treat the guide's phases (soloader structure, FalsoJNI resolution
-order, asset fallback strategy, touch-slot mapping, VPK packaging) as generically applicable, but
-don't assume cocos2d-x-specific symbol names (`CCFileUtils`, `CC_MAX_TOUCHES`, `nativeSetPaths`,
-`Java_org_cocos2dx_lib_...`) exist in this binary — confirm everything against `libgameDSO.so` with
-`nm`/`strings` per Fase 1 of the guide, on this binary, not by assumption from prior ports.
-
-## This game's specifics (already confirmed by analysis)
-
-- Single native library: `zenonia-4-1-2-3/lib/armeabi/libgameDSO.so` (~1.6 MB, armeabi only — no
-  armeabi-v7a variant).
-- Engine is Gamevil's own proprietary in-house engine (**not** cocos2d-x): exported native entry
-  points are under `Java_com_gamevil_nexus2_Natives_*` (`NativeInitWithBufferSize`, `NativeRender`,
-  `NativeResize`, `handleCletEvent`, etc.), and internal C++ classes use `CGs*` (Gamevil System),
-  `CMv*`, `CZn*` (Zenonia) prefixes — e.g. `CGsTouchMgr`, `CMvApp`, `CZnTouchKeypad`.
-- Main Android entry point is `.SkeletonLauncher` (see `AndroidManifest.xml`).
-- Uses Tapjoy for ads (`com/tapjoy`, `assets/js/mraid.js`) and Google C2DM/GCM for push — these are
-  strong no-op candidates per Fase 3 of the porting guide, but confirm each stub doesn't block on a
-  callback the engine actually waits for.
-- Game data/assets use Gamevil's own proprietary formats (`.zt1` for text tables/dialogue,
-  `.pzx` for packed resources) rather than anything cocos2d-x-standard — don't assume a familiar
-  asset pipeline, inspect these per-game.
-- No `.obb` present alongside the APK in this repo — assets ship inside `assets/` in the APK itself
-  (`assets/data`, `assets/script`, `assets/map`, `assets/char`, `assets/obj`, `assets/font`, per-locale
-  dirs `eng/chi/jpn/deu/fra/tai`, etc.). Confirm experimentally (Fase 5 of the guide) how the engine
-  actually resolves these paths before choosing an asset-packaging strategy for the Vita build.
+`loader/dynlib.c` is the biggest file (~2100 lines): the import-resolution table plus essentially all
+runtime GL/engine hooks — `glDrawArrays_wrapper`/`glColorPointer_wrapper`/etc. (GL_FIXED→float
+conversion, engine GL-state shadowing, the vertex-color-array whitening fix), the RGB565 direct-upload
+path, `PutCompressImg_hook` (the sprite-diversion point + a crash guard for an invalid `param_9`), and
+— under `GPU_QUADS` — `DrawToFrameBuffer_hook` (text), `Screen_RGBBLEND16_Real_hook` (solid fills),
+`DrawNativeFillEllipse_hook` (rounded corners). `loader/gpu_quads.c`/`.h` holds the actual GPU-quad
+cache/queue/compositing machinery these hooks feed into (`gpu_quads_enqueue_text`/`_fill`,
+`gpu_quads_lookup_and_enqueue`/`_finish_decode` for sprites, `gpu_quads_flush`).
 
 ## Adapting `porting_tools/`
 
-Every script under `porting_tools/` was written for a **different, prior port** and hardcodes that
-project's paths/names. None of them work out of the box for Zenonia 4 — read each one before running
-it and update the marked variables:
+Most scripts under `porting_tools/` were written for a **different, prior port** (Dungeon Hunter 2 or
+Prince of Persia Classic) and hardcode that project's paths/names — read each one before running it.
+Two have already been adapted for Zenonia 4 specifically this session (see above): `build_and_install.sh`
+and `manage_vita.py`. The rest, still templates:
 
-- **`porting_tools/build/build_and_install.sh`** — hardcodes `BUILD_DIR=/tmp/dh2-build`,
-  `SRC_DIR=/tmp/dh2-src`, `VPK_NAME="dungeon_hunter_2.vpk"`, and an `rsync --exclude` list tuned to
-  that project's extracted-APK folder names. Rewrite these for this Zenonia 4 tree (which now has a
-  real `CMakeLists.txt`/`source/`/`lib/` to build).
-- **`porting_tools/manage_vita.py`** — hardcodes `VITA_IP`, `VITA_PORT`, `LOCAL_VPK_PATH`,
-  `VITA_DATA_DIR`, `VITA_LOGS_DIR`, `VITA_CG_DIR` for Dungeon Hunter 2's title ID/folder name; also
-  shells out to `protonvpn-cli disconnect`, which assumes that tool is installed. Update the constants
-  at the top of the file before use.
-- **`porting_tools/build/deploy_and_launch_vita3k.sh`** — hardcodes `/tmp/dh2-build`, a Vita3K
-  `fs/ux0/app/PSVDH0002` install path, and a log filename tied to Dungeon Hunter 2's title ID; also
-  depends on `porting_tools/automation/click_helper.py` and a screen-coordinate offset measured for
-  that project's Vita3K window layout.
-- **`porting_tools/build/decompile_all.sh`** — hardcodes `BASE_DIR`, `APK_FILE`, and `LIB_DIR` for a
-  `Dungeon-Hunter-2-vita` sibling directory. Point it at
-  `"/Volumes/Seagate/PSVITA Develop/Zenonia4-vita"`, `zenonia-4-1-2-3.apk`, and
-  `zenonia-4-1-2-3/lib` before running (it drives `jadx` for the Java side and
-  `devrvk/so-decompiler`/Ghidra via Docker for `libgameDSO.so`).
-- **`porting_tools/tests/run_tests.sh`** — a host-side pre-build test harness for Prince of Persia
-  Classic's audio path/decoder (`libgame_logic.so`/`libcocosdenshion.so`, `ux0_data/popclassic`). Not
-  applicable to Zenonia 4 as-is; treat it as a template for whatever host-testable logic (if any) the
-  Vita port ends up needing.
-- **`porting_tools/build/clean_macos.sh`** — safe to use as-is; deletes macOS `._*` junk files that
-  accumulate from non-HFS+ volumes (this repo lives on `/Volumes/Seagate/...`) and can confuse
-  packaging tools if left in a build tree.
-- **`porting_tools/misc/get_dump.sh <vita-ip>`** — safe to use as-is; fetches the newest `.psp2dmp`
-  core dump from the console over FTP (port 1337, VitaShell's FTP server). Functionally identical to
-  `extras/scripts/get_dump.sh`, which is the one actually wired into the CMake `dump` target.
-- **`porting_tools/automation/*.py`** (`click_helper.py`, `hold_click.py`, `mousedown_only.py`,
-  `mouseup_only.py`, `key_helper.py`) — generic Quartz-based synthetic mouse/keyboard injection for
-  automating the Vita3K emulator's Qt UI (which ignores AppleScript/accessibility clicks). Reusable
-  as-is; require `pip install pyobjc`.
-- **`porting_tools/misc/translate_docs.py`** — generic Markdown batch translator via
-  `deep_translator`/Google Translate; requires `pip install deep-translator`.
+- **`porting_tools/build/deploy_and_launch_vita3k.sh`** — hardcodes a Vita3K install path and a log
+  filename tied to Dungeon Hunter 2's title ID; depends on `porting_tools/automation/click_helper.py`
+  with a screen-coordinate offset measured for that project's window layout.
+- **`porting_tools/build/decompile_all.sh`** — hardcodes paths for a `Dungeon-Hunter-2-vita` sibling
+  directory; point it at this repo, `zenonia-4-1-2-3.apk`, `zenonia-4-1-2-3/lib` before running.
+- **`porting_tools/tests/run_tests.sh`** — a host-side test harness for Prince of Persia Classic's
+  audio path; not applicable as-is.
+- **`porting_tools/build/clean_macos.sh`**, **`porting_tools/misc/get_dump.sh`** — safe to use as-is
+  (generic macOS junk-file cleanup / FTP core-dump fetch, no hardcoded project specifics).
+- **`porting_tools/automation/*.py`** — generic Quartz-based synthetic mouse/keyboard injection for
+  Vita3K's Qt UI; reusable as-is (`pip install pyobjc`).
+- **`porting_tools/misc/translate_docs.py`** — generic Markdown translator; requires
+  `pip install deep-translator`.
+
+## This game's specifics (confirmed by analysis, not assumed)
+
+- Single native library: `libgameDSO.so` (~1.6 MB, armeabi only).
+- Data/assets use Gamevil's own proprietary formats (`.zt1` text tables/dialogue, `.pzx` packed
+  resources) — served as opaque bytes via `readAssets`, no custom parser needed in the loader. No
+  `.obb`; assets ship inside the APK's own `assets/` tree, mirrored locally under `ux0_data/`.
+- Save files: `option.sav`/`SaveN.dat` under `ux0:data/zenonia-4/saves/` — the engine passes a real
+  JNI `jbyteArray` (a `JavaDynArray*` in FalsoJNI, not a raw Dalvik-layout pointer — a real, previously
+  save-corrupting bug, see Fase 12) for save data, but a raw offset-based struct for `readAssets`
+  results — these are two *different* conventions, do not conflate them if touching `saveFile`/
+  `loadFile`/`readAssets` again.
+- Tapjoy/GCM/IAB are confirmed no-op-safe (native-side symbols exist in the `.so` but nothing calls
+  back into "Java" expecting a real backend).
+- Rendering is entirely software (a CPU-composited framebuffer uploaded as one texture per frame) with
+  several distinct direct-framebuffer-write code paths beyond the obvious sprite blitter — see "Where
+  things stand" above; assume there may be more not yet found if a new "renders but element X is
+  missing/misordered under GPU_QUADS" symptom appears.
 
 ## Toolchain expectations
 
-Per `psvita-port-toolkit/PORTING_GUIDE.md` Fase 0: VitaSDK (`-softfp` variant), `kubridge` (kernel
-plugin, hardware only — `soloader_init_all()` hard-fails at startup if it's not loaded),
-`libshacccg.suprx` present on the test console, and — since this project links `vitaGL` — a
-version/commit pinned deliberately against the installed vitasdk-softfp. Watch for spaces in the
-project path (`"PSVITA Develop"` in this repo's own path breaks `vita-pack-vpk`) — the reused
-`porting_tools` build scripts route around this via a `/tmp` build/src staging directory; keep that
-workaround (or an equivalent) when driving the real `cmake`/`make` build from automation.
+VitaSDK (`-softfp` variant), `kubridge` (kernel plugin, hardware only), `libshacccg.suprx` present on
+the console, a vitaGL build pinned against the installed vitasdk-softfp. **The vitasdk-gcc in current
+use is GCC 15.2**, which (since GCC 14) promotes several old-style-C warnings to hard errors by
+default — `CMakeLists.txt` downgrades the real ones (`incompatible-pointer-types`, `int-conversion`,
+`implicit-function-declaration`, `implicit-int`) back to warnings for the sake of vendored code written
+for older compilers. Do not add a new `-Wno-error=X` without confirming `X` is a real warning name for
+*this* GCC — an invented one (e.g. `return-mismatch`, which doesn't exist and was found breaking the
+build for an unknown stretch of time, see Fase 57) silently aborts compilation for every file, not just
+the one that prompted it. Watch for spaces in the project path (`"PSVITA Develop"` breaks
+`vita-pack-vpk`) — `build.sh` already stages in `/tmp` to route around this; keep that workaround if
+scripting the build further.
 
 ## Git hygiene note
 
-`.gitignore` has a broad `lib/` + `*.so` rule under an "Exclude copyrighted files" comment, left over
-from an earlier Zenonia 3 port's `.gitignore` (there are also unrelated `zenonia3`/`zenonia3_java`
-entries above it, harmless but stale). In *this* repo, `lib/` is not just extracted Android
-libraries — it's also the soloader's own vendored source (`lib/so_util`, `lib/falso_jni`, `lib/sha1`,
-`lib/fios`, `lib/libc_bridge`, `lib/kubridge`), which needs to be tracked in git. As-is, `git add`
-will silently skip all of it. Fix the `.gitignore` (e.g. scope the exclusion to the extracted-APK
-directory only) before the first commit that's meant to include the soloader project.
+`.gitignore` has a broad `lib/` + `*.so` rule under an old "Exclude copyrighted files" comment,
+left over from an earlier Zenonia 3 port. In this repo, `lib/` is not just extracted Android
+libraries — it also holds the soloader's own vendored source, which is tracked despite the broad
+pattern via the files already being force-added in the initial commit. Be careful with any blanket
+`git add`/`git clean` in `lib/` — check `git status` first rather than assuming the ignore pattern is
+harmless.

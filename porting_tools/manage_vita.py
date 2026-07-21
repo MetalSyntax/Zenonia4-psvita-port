@@ -8,7 +8,13 @@ from ftplib import FTP, all_errors
 
 VITA_IP = "192.168.3.15"
 VITA_PORT = 1337
-LOCAL_VPK_PATH = "build/zenonia_4.vpk"
+# Carpeta donde build.sh/build_and_install.sh dejan los .vpk generados. A
+# diferencia de un LOCAL_VPK_PATH fijo a un solo archivo, esto se recorre
+# dinamicamente (ver list_local_vpks()) para soportar cualquier cantidad de
+# variantes de build (zenonia_4.vpk, zenonia_4_gpu_quads_test.vpk, etc.) sin
+# tener que hardcodear cada nombre -- generico para cualquier proyecto que
+# genere sus VPKs bajo esta carpeta, no solo Zenonia 4.
+BUILD_DIR = "build"
 VITA_DOWNLOADS_DIR = "/ux0:/downloads"
 VITA_DATA_DIR = "/ux0:/data"
 VITA_LOGS_DIR = "/ux0:/data/zenonia-4/logs"
@@ -97,9 +103,60 @@ def create_directory_if_not_exists(ftp, path):
         except all_errors as e:
             print(f"[-] No se pudo crear el directorio '{path}': {e}")
 
+def list_local_vpks():
+    """Todos los .vpk en BUILD_DIR/, mas reciente primero -- detecta
+    automaticamente cualquier variante de build (build.sh genera un nombre
+    de VPK distinto por flag, ver build.sh --help en la cabecera del
+    archivo) sin que este script tenga que conocer sus nombres de antemano."""
+    project_root = os.path.dirname(BASE_DIR)
+    build_dir = os.path.join(project_root, BUILD_DIR)
+    if not os.path.isdir(build_dir):
+        return []
+    vpks = [
+        os.path.join(build_dir, f) for f in os.listdir(build_dir)
+        if f.endswith(".vpk") and not f.startswith("._")
+    ]
+    vpks.sort(key=os.path.getmtime, reverse=True)
+    return vpks
+
+
+def choose_vpk():
+    """Si hay un solo VPK lo usa directo; si hay varios, muestra un menu
+    (tamano + fecha de modificacion para distinguir variantes de un vistazo)
+    y deja elegir -- Enter usa el mas reciente."""
+    vpks = list_local_vpks()
+    if not vpks:
+        print(f"[-] No se encontró ningún .vpk en '{BUILD_DIR}/'. Compilá el proyecto primero "
+              f"(build.sh o build_and_install.sh, opción 5 de este menú).")
+        return None
+
+    if len(vpks) == 1:
+        print(f"[*] Un solo VPK encontrado: {os.path.basename(vpks[0])}")
+        return vpks[0]
+
+    print(f"[*] Se encontraron {len(vpks)} VPKs en '{BUILD_DIR}/' (más reciente primero):")
+    for i, path in enumerate(vpks, 1):
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
+        print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
+    print()
+
+    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}] (Enter = el más reciente): ").strip()
+    if not choice:
+        return vpks[0]
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(vpks):
+            return vpks[idx - 1]
+    except ValueError:
+        pass
+    print("[-] Opción inválida.")
+    return None
+
+
 def upload_vpk():
-    if not os.path.exists(LOCAL_VPK_PATH):
-        print(f"[-] Error: No se encontró el archivo VPK local en '{LOCAL_VPK_PATH}'.")
+    local_vpk_path = choose_vpk()
+    if not local_vpk_path:
         return
 
     disconnect_proton_vpn()
@@ -109,14 +166,14 @@ def upload_vpk():
 
     try:
         create_directory_if_not_exists(ftp, VITA_DOWNLOADS_DIR)
-        filename = os.path.basename(LOCAL_VPK_PATH)
+        filename = os.path.basename(local_vpk_path)
         dest_file_path = f"{VITA_DOWNLOADS_DIR}/{filename}"
 
-        print(f"[*] Subiendo {LOCAL_VPK_PATH} a {dest_file_path}...")
-        
-        with open(LOCAL_VPK_PATH, "rb") as f:
+        print(f"[*] Subiendo {local_vpk_path} a {dest_file_path}...")
+
+        with open(local_vpk_path, "rb") as f:
             ftp.storbinary(f"STOR {dest_file_path}", f)
-            
+
         print(f"[+] Transferencia exitosa! Instala el VPK en tu Vita desde '{VITA_DOWNLOADS_DIR.replace('/ux0:', 'ux0:')}/{filename}'")
     except all_errors as e:
         print(f"[-] Falló la transferencia del VPK: {e}")
@@ -543,7 +600,7 @@ def run_script(folder, script_name, is_python=False):
 def main():
     while True:
         print_banner()
-        print("1. Subir VPK compilado a la PS Vita (ux0:downloads/)")
+        print("1. Subir VPK compilado a la PS Vita (ux0:downloads/) -- elige entre los .vpk de build/")
         print("2. Descargar el último dump (.dmp) y log (.txt) de Zenonia 4")
         print("3. Desconectar Proton VPN ahora mismo")
         print("4. Ejecutar clean_macos.sh (build/)")
