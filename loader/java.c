@@ -24,6 +24,12 @@
 
 #include "audio.h"
 #include "font.h"
+#ifdef ZENONIA_GPU_QUADS
+#include "gpu_quads.h"
+#endif
+#ifdef ZENONIA_SPRITE_DECODE_CACHE
+#include "sprite_decode.h"
+#endif
 
 extern void game_log(const char *fmt, ...);
 
@@ -566,6 +572,28 @@ jobject Zenonia_getDeviceID(jmethodID id, va_list args) {
 void Zenonia_OnUIStatusChange(jmethodID id, va_list args) {
     int status = va_arg(args, int);
     game_log("[Java] OnUIStatusChange: %d\n", status);
+#ifdef ZENONIA_GPU_QUADS
+    // Fase 69 (2026-07-23): 19 = "transicion" (confirmado en port_progress.md,
+    // Fase 30 y 53: siempre entre el UI real -1/14 y el gameplay, y Fase 45
+    // registra un crash real justo DESPUES de `OnUIStatusChange: 19` durante
+    // la carga de datos `.zt1` -- la senal real de que el motor va a liberar
+    // los assets del stage anterior y cargar los del nuevo). Invalidar ANTES
+    // de que status vuelva a 14 (gameplay) evita que sprites del stage nuevo, si
+    // caen en una direccion de heap reciclada de un buffer ya cacheado, sirvan
+    // la textura VIEJA por una coincidencia de hash (ver gpu_quads.c).
+    if (status == 19 && g_ui_status != 19) {
+        gpu_quads_invalidate_cache();
+    }
+#endif
+#ifdef ZENONIA_SPRITE_DECODE_CACHE
+    // Fase 83: mismo motivo y misma senal que gpu_quads_invalidate_cache()
+    // arriba -- un puntero de heap reciclado entre stages con contenido
+    // nuevo podria coincidir por casualidad con el hash de una entrada vieja
+    // (ver comentario extenso en sprite_decode.c).
+    if (status == 19 && g_ui_status != 19) {
+        sprite_cache_invalidate();
+    }
+#endif
     g_ui_status = status;
 }
 

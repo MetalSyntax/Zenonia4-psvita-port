@@ -18,6 +18,7 @@
 #include <arm_neon.h>
 #include "so_util.h"
 #include "neon_mem.h"
+#include "sprite_decode.h"
 #ifdef ZENONIA_GPU_QUADS
 #include "gpu_quads.h"
 #endif
@@ -468,6 +469,15 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
         }
         p9 = 0;
     }
+#ifdef ZENONIA_SPRITE_DECODE_CACHE
+    // Fase 83: solo op==0 (COPY, mismo criterio conservador que GPU_QUADS
+    // usaba antes de la Fase 50) -- ver sprite_decode.c para el resto del
+    // mecanismo (consumido por DrawOP_COPY_Compress_16_Vita mas abajo en la
+    // misma llamada sincronica).
+    if (op == 0) {
+        sprite_cache_set_pending_dims(p5, p3, p4);
+    }
+#endif
     so_unhook(&g_putcompressimg_hook);
     ((void (*)(int, int, int, int, unsigned char *, unsigned short *, int, int, long))
         (g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr))
@@ -476,6 +486,53 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
         g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr,
         (uintptr_t) PutCompressImg_hook);
 }
+
+// --- Fase 86 (port_progress.md): conteo de CGxFACharCache::DrawToFrameBuffer,
+// INDEPENDIENTE de GPU_QUADS ---
+//
+// Motivado por un dato real de --frame-phases-probe (Fase 85): la pantalla de
+// menu (ui_status=1, sin sprites .pzx de gameplay) ya costaba 87ms de
+// NativeRender -- casi tanto como el gameplay real (149-152ms). Un menu es
+// mayormente texto/UI, no sprites -- candidato directo:
+// CGxFACharCache::DrawToFrameBuffer (confirmado en la Fase 59 que dibuja texto
+// DIRECTO al framebuffer, un blend alpha por pixel manual, out_ghidra.c:9872-
+// 10154), simbolo ya resuelto para el hook de GPU_QUADS de mas abajo pero
+// nunca medido por SU COSTO -- solo se toco antes para arreglar el orden de
+// capas visual. Contador de solo-conteo pass-through (mismo patron que
+// zenonia_install_cgsgraphics_probe), SIN reemplazar el dibujo real -- a
+// diferencia del hook de GPU_QUADS (mas abajo), que SI reemplaza el efecto
+// completo por un quad. Mismo caveat que los demas *_probe: agrega overhead
+// real por-llamada (unhook/llamar original/rehook por cada glifo dibujado),
+// el FPS de este build NO es comparable al normal -- solo importa el contador.
+volatile unsigned int g_drawtoframebuffer_calls_this_frame = 0;
+
+#ifdef ZENONIA_INSTRUMENT_TEXT_CALLS
+static so_hook g_drawtoframebuffer_counter_hook;
+static int DrawToFrameBuffer_counter_hook(void *this_ptr, void *char_unit_info, int screen_x, int screen_y) {
+    g_drawtoframebuffer_calls_this_frame++;
+    so_unhook(&g_drawtoframebuffer_counter_hook);
+    int ret = ((int (*)(void *, void *, int, int))
+        (g_drawtoframebuffer_counter_hook.thumb_addr ? g_drawtoframebuffer_counter_hook.thumb_addr : g_drawtoframebuffer_counter_hook.addr))
+        (this_ptr, char_unit_info, screen_x, screen_y);
+    g_drawtoframebuffer_counter_hook = hook_addr(
+        g_drawtoframebuffer_counter_hook.thumb_addr ? g_drawtoframebuffer_counter_hook.thumb_addr : g_drawtoframebuffer_counter_hook.addr,
+        (uintptr_t) DrawToFrameBuffer_counter_hook);
+    return ret;
+}
+
+void zenonia_install_text_calls_probe(so_module *mod) {
+    uintptr_t addr = so_symbol(mod, "_ZN14CGxFACharCache17DrawToFrameBufferEPN4gxfa12CharUnitInfoEii");
+    if (addr) {
+        g_drawtoframebuffer_counter_hook = hook_addr(addr, (uintptr_t) DrawToFrameBuffer_counter_hook);
+        so_flush_caches(mod);
+        game_log("[TextCallsProbe] hook de conteo instalado en CGxFACharCache::DrawToFrameBuffer (0x%08x)\n", (unsigned int) addr);
+    } else {
+        game_log("[TextCallsProbe] error: no se encontro CGxFACharCache::DrawToFrameBuffer\n");
+    }
+}
+#else
+void zenonia_install_text_calls_probe(so_module *mod) { (void) mod; }
+#endif
 
 #ifdef ZENONIA_GPU_QUADS
 // --- Fase 59 (port_progress.md): CGxFACharCache::DrawToFrameBuffer -> quads GPU ---
@@ -817,15 +874,68 @@ void zenonia_install_hotpath_probe(so_module *mod) {
 // lee r0, asi que forwardear de mas es inofensivo; asumir void de menos en
 // una funcion que si devuelve algo si seria un bug real.
 //
-// UN SOLO contador agregado (no uno por primitiva, para no inflar el log) --
-// si sale alto, una ronda de seguimiento puede desglosar cual de las 13
-// domina, mismo patron iterativo que la Fase 31.
+// Contador agregado (para el log de siempre, avg_cgsgraphics_per_frame) MAS
+// un desglose por primitiva -- Fase 41/42 (port_progress.md) ya habian notado
+// que el agregado solo no alcanza para saber cual de las ~13 domina (p.ej.
+// --primitives-opt-test dio pantalla negra sin poder saber si el tiempo
+// perdido era realmente en FastClearNonClipping/RGBBlend16 o en otra cosa).
+// Array indexado por CGSGFX_* en vez de 13 variables sueltas para no repetir
+// el mismo bloque de acumulacion/reset 13 veces en main.c.
 volatile unsigned int g_cgsgraphics_calls_this_frame = 0;
+
+enum {
+    CGSGFX_DRAWLINE = 0,
+    CGSGFX_DRAWFILLRECT,
+    CGSGFX_DRAWROUNDRECT,
+    CGSGFX_DRAWFILLROUNDRECT,
+    CGSGFX_DRAWELLIPSE4,
+    CGSGFX_DRAWELLIPSE7,
+    CGSGFX_DRAWFILLELLIPSE,
+    CGSGFX_CLEARSCREEN,
+    CGSGFX_BEGINSCREEN,
+    CGSGFX_FASTCLEARNONCLIPPING,
+    CGSGFX_GETFRAMEBUFFERPTR,
+    CGSGFX_PUTPIXEL2,
+    CGSGFX_PUTPIXEL3,
+    CGSGFX_COUNT
+};
+static volatile unsigned int g_cgsgraphics_calls_by_kind[CGSGFX_COUNT] = {0};
+
+// Llamada cada 120 frames desde main.c, mismo checkpoint que el resto de los
+// avg_*_per_frame -- imprime el promedio por-frame de CADA primitiva en una
+// sola linea y resetea el desglose (el agregado avg_cgsgraphics_per_frame
+// sigue su propio accum/reset en main.c, sin tocar). 0.0 en todas siempre que
+// INSTRUMENT_CGSGRAPHICS_CALLS este OFF, ya que ningun hook incrementa
+// g_cgsgraphics_calls_by_kind en ese caso.
+void zenonia_log_cgsgraphics_breakdown(unsigned int window_frames) {
+    if (window_frames == 0) return;
+    game_log("[CGsGraphicsProbe] breakdown avg/frame (ultimos %u): "
+             "DrawLine=%.1f DrawFillRect=%.1f DrawRoundRect=%.1f DrawFillRoundRect=%.1f "
+             "DrawEllipse4=%.1f DrawEllipse7=%.1f DrawFillEllipse=%.1f ClearScreen=%.1f "
+             "BeginScreen=%.1f FastClearNonClipping=%.1f GetFrameBufferPtr=%.1f "
+             "PutPixel2=%.1f PutPixel3=%.1f\n",
+             window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWLINE] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLRECT] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWROUNDRECT] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLROUNDRECT] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWELLIPSE4] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWELLIPSE7] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLELLIPSE] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_CLEARSCREEN] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_BEGINSCREEN] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_FASTCLEARNONCLIPPING] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_GETFRAMEBUFFERPTR] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_PUTPIXEL2] / (float) window_frames,
+             g_cgsgraphics_calls_by_kind[CGSGFX_PUTPIXEL3] / (float) window_frames);
+    for (int i = 0; i < CGSGFX_COUNT; i++) g_cgsgraphics_calls_by_kind[i] = 0;
+}
 
 #ifdef ZENONIA_INSTRUMENT_CGSGRAPHICS
 static so_hook g_cgsgfx_drawline_hook;
 static int CGsGraphics_DrawLine_counter_hook(void *this_ptr, int a, int b, int c, int d, unsigned int e) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWLINE]++;
     so_unhook(&g_cgsgfx_drawline_hook);
     int ret = ((int (*)(void *, int, int, int, int, unsigned int))
         (g_cgsgfx_drawline_hook.thumb_addr ? g_cgsgfx_drawline_hook.thumb_addr : g_cgsgfx_drawline_hook.addr))
@@ -839,6 +949,7 @@ static int CGsGraphics_DrawLine_counter_hook(void *this_ptr, int a, int b, int c
 static so_hook g_cgsgfx_drawfillrect_hook;
 static int CGsGraphics_DrawFillRect_counter_hook(void *this_ptr, int a, int b, int c, int d, unsigned int e) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLRECT]++;
     so_unhook(&g_cgsgfx_drawfillrect_hook);
     int ret = ((int (*)(void *, int, int, int, int, unsigned int))
         (g_cgsgfx_drawfillrect_hook.thumb_addr ? g_cgsgfx_drawfillrect_hook.thumb_addr : g_cgsgfx_drawfillrect_hook.addr))
@@ -852,6 +963,7 @@ static int CGsGraphics_DrawFillRect_counter_hook(void *this_ptr, int a, int b, i
 static so_hook g_cgsgfx_drawroundrect_hook;
 static int CGsGraphics_DrawRoundRect_counter_hook(void *this_ptr, int a, int b, int c, int d, int e, unsigned int f) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWROUNDRECT]++;
     so_unhook(&g_cgsgfx_drawroundrect_hook);
     int ret = ((int (*)(void *, int, int, int, int, int, unsigned int))
         (g_cgsgfx_drawroundrect_hook.thumb_addr ? g_cgsgfx_drawroundrect_hook.thumb_addr : g_cgsgfx_drawroundrect_hook.addr))
@@ -865,6 +977,7 @@ static int CGsGraphics_DrawRoundRect_counter_hook(void *this_ptr, int a, int b, 
 static so_hook g_cgsgfx_drawfillroundrect_hook;
 static int CGsGraphics_DrawFillRoundRect_counter_hook(void *this_ptr, int a, int b, int c, int d, int e, unsigned int f) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLROUNDRECT]++;
     so_unhook(&g_cgsgfx_drawfillroundrect_hook);
     int ret = ((int (*)(void *, int, int, int, int, int, unsigned int))
         (g_cgsgfx_drawfillroundrect_hook.thumb_addr ? g_cgsgfx_drawfillroundrect_hook.thumb_addr : g_cgsgfx_drawfillroundrect_hook.addr))
@@ -878,6 +991,7 @@ static int CGsGraphics_DrawFillRoundRect_counter_hook(void *this_ptr, int a, int
 static so_hook g_cgsgfx_drawellipse4_hook;
 static int CGsGraphics_DrawEllipse4_counter_hook(void *this_ptr, int a, int b, int c, unsigned int d) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWELLIPSE4]++;
     so_unhook(&g_cgsgfx_drawellipse4_hook);
     int ret = ((int (*)(void *, int, int, int, unsigned int))
         (g_cgsgfx_drawellipse4_hook.thumb_addr ? g_cgsgfx_drawellipse4_hook.thumb_addr : g_cgsgfx_drawellipse4_hook.addr))
@@ -891,6 +1005,7 @@ static int CGsGraphics_DrawEllipse4_counter_hook(void *this_ptr, int a, int b, i
 static so_hook g_cgsgfx_drawellipse7_hook;
 static int CGsGraphics_DrawEllipse7_counter_hook(void *this_ptr, int a, int b, int c, int d, unsigned int e, int f, int g) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWELLIPSE7]++;
     so_unhook(&g_cgsgfx_drawellipse7_hook);
     int ret = ((int (*)(void *, int, int, int, int, unsigned int, int, int))
         (g_cgsgfx_drawellipse7_hook.thumb_addr ? g_cgsgfx_drawellipse7_hook.thumb_addr : g_cgsgfx_drawellipse7_hook.addr))
@@ -916,6 +1031,7 @@ static int CGsGraphics_DrawEllipse7_counter_hook(void *this_ptr, int a, int b, i
 static so_hook g_cgsgfx_drawfillellipse_hook;
 static long long CGsGraphics_DrawFillEllipse_counter_hook(void *this_ptr, int a, int b, int c, int d, unsigned int e, int f, int g) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_DRAWFILLELLIPSE]++;
     so_unhook(&g_cgsgfx_drawfillellipse_hook);
     long long ret = ((long long (*)(void *, int, int, int, int, unsigned int, int, int))
         (g_cgsgfx_drawfillellipse_hook.thumb_addr ? g_cgsgfx_drawfillellipse_hook.thumb_addr : g_cgsgfx_drawfillellipse_hook.addr))
@@ -929,6 +1045,7 @@ static long long CGsGraphics_DrawFillEllipse_counter_hook(void *this_ptr, int a,
 static so_hook g_cgsgfx_clearscreen_hook;
 static long long CGsGraphics_ClearScreen_counter_hook(void *this_ptr, unsigned int a) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_CLEARSCREEN]++;
     so_unhook(&g_cgsgfx_clearscreen_hook);
     long long ret = ((long long (*)(void *, unsigned int))
         (g_cgsgfx_clearscreen_hook.thumb_addr ? g_cgsgfx_clearscreen_hook.thumb_addr : g_cgsgfx_clearscreen_hook.addr))
@@ -942,6 +1059,7 @@ static long long CGsGraphics_ClearScreen_counter_hook(void *this_ptr, unsigned i
 static so_hook g_cgsgfx_beginscreen_hook;
 static long long CGsGraphics_BeginScreen_counter_hook(void *this_ptr, unsigned int a) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_BEGINSCREEN]++;
     so_unhook(&g_cgsgfx_beginscreen_hook);
     long long ret = ((long long (*)(void *, unsigned int))
         (g_cgsgfx_beginscreen_hook.thumb_addr ? g_cgsgfx_beginscreen_hook.thumb_addr : g_cgsgfx_beginscreen_hook.addr))
@@ -955,6 +1073,7 @@ static long long CGsGraphics_BeginScreen_counter_hook(void *this_ptr, unsigned i
 static so_hook g_cgsgfx_fastclearnonclipping_hook;
 static long long CGsGraphics_FastClearNonClipping_counter_hook(void *this_ptr, int a, int b, int c, int d) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_FASTCLEARNONCLIPPING]++;
     so_unhook(&g_cgsgfx_fastclearnonclipping_hook);
     long long ret = ((long long (*)(void *, int, int, int, int))
         (g_cgsgfx_fastclearnonclipping_hook.thumb_addr ? g_cgsgfx_fastclearnonclipping_hook.thumb_addr : g_cgsgfx_fastclearnonclipping_hook.addr))
@@ -968,6 +1087,7 @@ static long long CGsGraphics_FastClearNonClipping_counter_hook(void *this_ptr, i
 static so_hook g_cgsgfx_getframebufferptr_hook;
 static int CGsGraphics_GetFrameBufferPtr_counter_hook(void *this_ptr, int a, int b) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_GETFRAMEBUFFERPTR]++;
     so_unhook(&g_cgsgfx_getframebufferptr_hook);
     int ret = ((int (*)(void *, int, int))
         (g_cgsgfx_getframebufferptr_hook.thumb_addr ? g_cgsgfx_getframebufferptr_hook.thumb_addr : g_cgsgfx_getframebufferptr_hook.addr))
@@ -981,6 +1101,7 @@ static int CGsGraphics_GetFrameBufferPtr_counter_hook(void *this_ptr, int a, int
 static so_hook g_cgsgfx_putpixel2_hook;
 static int CGsGraphics_PutPixel2_counter_hook(void *this_ptr, int a, int b) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_PUTPIXEL2]++;
     so_unhook(&g_cgsgfx_putpixel2_hook);
     int ret = ((int (*)(void *, int, int))
         (g_cgsgfx_putpixel2_hook.thumb_addr ? g_cgsgfx_putpixel2_hook.thumb_addr : g_cgsgfx_putpixel2_hook.addr))
@@ -994,6 +1115,7 @@ static int CGsGraphics_PutPixel2_counter_hook(void *this_ptr, int a, int b) {
 static so_hook g_cgsgfx_putpixel3_hook;
 static int CGsGraphics_PutPixel3_counter_hook(void *this_ptr, int a, int b, unsigned int c) {
     g_cgsgraphics_calls_this_frame++;
+    g_cgsgraphics_calls_by_kind[CGSGFX_PUTPIXEL3]++;
     so_unhook(&g_cgsgfx_putpixel3_hook);
     int ret = ((int (*)(void *, int, int, unsigned int))
         (g_cgsgfx_putpixel3_hook.thumb_addr ? g_cgsgfx_putpixel3_hook.thumb_addr : g_cgsgfx_putpixel3_hook.addr))
@@ -1223,9 +1345,24 @@ void *convert_rgb565_to_rgba8888(const void *pixels, int width, int height) {
         uint16x8_t g8_16 = vorrq_u16(vshlq_n_u16(g6, 2), vshrq_n_u16(g6, 4));
         uint16x8_t b8_16 = vorrq_u16(vshlq_n_u16(b5, 3), vshrq_n_u16(b5, 2));
 
-        // Color-key 0x0001 -> alpha 0, else 0xFF (base FB background)
+        // Fase 79 (2026-07-24): color-key 0x0001 -> alpha 0 -- leftover de la
+        // arquitectura PRE-GPU_QUADS (ver comentario de mas arriba, "el motor
+        // sube el framebuffer... antes de CADA quad"), de cuando este buffer
+        // era la superficie de composicion de sprites en si y la
+        // transparencia por color-key importaba para que un sprite dejara
+        // ver lo ya dibujado debajo EN EL MISMO buffer. Bajo GPU_QUADS este
+        // buffer es SOLO la capa base (fondo/CGsGraphics), sin nada detras --
+        // aplicar el color-key aca hace transparentes los pixeles "vacios"
+        // del fondo (la mayoria de la pantalla, ya que los sprites ya no
+        // escriben aca), rompiendo la composicion (candidato real para "los
+        // sprites desaparecen" al probar RGB565_DIRECT_UPLOAD=OFF + GPU_QUADS
+        // juntos, Fase 78). Bajo GPU_QUADS, alpha SIEMPRE opaco.
+#ifdef ZENONIA_GPU_QUADS
+        uint8x8_t alpha = vdup_n_u8(0xFF);
+#else
         uint16x8_t is_ckey = vceqq_u16(p, vdupq_n_u16(0x0001));
         uint8x8_t alpha = vmvn_u8(vmovn_u16(is_ckey));
+#endif
 
         uint8x8x4_t rgba;
         rgba.val[0] = vand_u8(vmovn_u16(r8_16), alpha);
@@ -1235,12 +1372,17 @@ void *convert_rgb565_to_rgba8888(const void *pixels, int width, int height) {
         vst4_u8(dst + i * 4, rgba); // interleaved R,G,B,A directo a memoria
     }
 
-    // Cola escalar (npix no multiplo de 8)
+    // Cola escalar (npix no multiplo de 8) -- mismo criterio de la Fase 79
+    // que la pasada NEON de arriba: bajo GPU_QUADS este buffer es solo la
+    // capa base opaca, el color-key 0x0001->transparente no aplica.
     for (; i < npix; i++) {
         uint16_t p = src[i];
+#ifndef ZENONIA_GPU_QUADS
         if (p == 0x0001) {
             ((uint32_t *) dst)[i] = 0x00000000u;
-        } else {
+        } else
+#endif
+        {
             uint32_t r5 = (p >> 11) & 0x1F, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
             uint32_t r = (r5 << 3) | (r5 >> 2);
             uint32_t g = (g6 << 2) | (g6 >> 4);
@@ -1425,6 +1567,29 @@ static void gpu_quads_restore_engine_state(void) {
 // asi que se convierte a RGBA8888 en CPU antes de subirlo. Mismo bug
 // confirmado en hardware real para Zenonia 2 (mismo motor).
 void glTexImage2D_wrapper(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels) {
+#ifdef ZENONIA_GPU_QUADS
+    // Fase 76 (2026-07-23): crash determinista real (3 `.psp2dmp` identicos,
+    // siempre PC=0x0 dentro de la propia `_glTexSubImage2D` de vitaGL) que
+    // sobrevivio al batching de la Fase 75 -- el volumen de draw calls no era
+    // la causa real. Hueco encontrado por revision de codigo:
+    // `gpu_quads_restore_engine_state()` (ver arriba) restaura la textura del
+    // motor SOLO al final de `glDrawArrays_wrapper` (una vez por frame) -- pero
+    // `gpu_quads_finish_decode`/`enqueue_text`/`enqueue_fill` (gpu_quads.c)
+    // llaman `glBindTexture` DIRECTO (sin pasar por este wrapper, sin
+    // actualizar `g_engine_bound_tex`) cada vez que decodifican un sprite/
+    // relleno/texto NUEVO -- esto pasa DURANTE el render del motor, ANTES de
+    // que el motor llame a su propio `glTexImage2D`/`glTexSubImage2D` para
+    // subir su framebuffer de software. Si eso pasa, la textura realmente
+    // bindeada en ese momento es la ULTIMA que gpu_quads creo, no la del
+    // motor -- el motor asume (razonablemente, para un motor que nunca
+    // esperaba que algo mas tocara su estado GL) que su textura sigue
+    // bindeada de la ultima vez que la bindeo el mismo. Re-bindear la textura
+    // del motor (ya trackeada en `g_engine_bound_tex`, actualizada por
+    // `glBindTexture_wrapper` cada vez que el motor bindea algo) justo antes
+    // de reenviar la llamada real cierra ese hueco sin tocar nada de
+    // gpu_quads.c ni cambiar el volumen/orden de nada.
+    glBindTexture(GL_TEXTURE_2D, g_engine_bound_tex);
+#endif
     static int img_log = 0;
     if (img_log < 10) {
         game_log("[GL] glTexImage2D target=%x intFmt=%x w=%d h=%d format=%x type=%x pixels=%p\n",
@@ -1467,6 +1632,32 @@ void glTexImage2D_wrapper(GLenum target, GLint level, GLint internalformat, GLsi
 }
 
 void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
+#ifdef ZENONIA_GPU_QUADS
+    // Fase 76: ver el comentario largo en glTexImage2D_wrapper -- mismo hueco,
+    // mismo fix. Esta es la llamada que realmente crashea en los 3 `.psp2dmp`
+    // (siempre LR dentro de esta funcion en vitaGL) -- la subida del
+    // framebuffer RGB565 del motor, que corre una vez por frame y opera sobre
+    // "lo que este bindeado ahora", sin re-bindear su propia textura primero.
+    //
+    // Fase 90/91 (port_progress.md): se probo agregar un diagnostico con
+    // glGetIntegerv(GL_TEXTURE_BINDING_2D, ...) justo aca para comparar la
+    // textura REALMENTE bindeada contra `g_engine_bound_tex` -- el usuario
+    // reporto que el build con ese diagnostico colgo la CONSOLA ENTERA
+    // (no un crash de app, sin `.psp2dmp`) jugando con GPU_QUADS, un
+    // sintoma mas grave que los 6 crashes de app ya documentados. REVERTIDO
+    // de inmediato como precaucion (ver Fase 91): `glGetIntegerv` puede
+    // forzar una sincronizacion/flush del pipeline de la GPU real -- si el
+    // estado de la cola de comandos ya estaba comprometido (el mismo
+    // territorio que la Fase 81 ya vio colgar la consola con
+    // DISABLE_VSYNC+GPU_QUADS), agregar una sincronizacion extra en ese
+    // momento exacto es un candidato plausible para convertir un crash
+    // recuperable (con dump) en un cuelgue real de hardware (sin dump, sin
+    // poder diagnosticar). No confirmado con certeza total (no se pudo
+    // probar la hipotesis alternativa por seguridad), pero el costo de
+    // sacarlo es cero y el riesgo de dejarlo es alto -- no se vuelve a
+    // agregar ninguna llamada que pueda sincronizar/esperar a la GPU en
+    // este call site sin antes confirmar que es segura.
+#endif
     static int subimg_log = 0;
     if (subimg_log < 10) {
         game_log("[GL] glTexSubImage2D target=%x w=%d h=%d format=%x type=%x\n", target, width, height, format, type);

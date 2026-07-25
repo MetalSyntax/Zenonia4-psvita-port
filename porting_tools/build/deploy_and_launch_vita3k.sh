@@ -16,7 +16,7 @@ export VITASDK
 export PATH="$VITASDK/bin:$PATH"
 
 BUILD_DIR="/tmp/zn4-build"
-APP_FS="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/app/SOLOADER0"
+APP_FS="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/app/PSVZ00004"
 FONT_SRC="$(cd "$(dirname "$0")/../.." && pwd)/extras/fonts/DejaVuSans.ttf"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -29,7 +29,7 @@ cp "$BUILD_DIR/eboot.bin" "$APP_FS/eboot.bin"
 if [ -f "$FONT_SRC" ]; then
     cp "$FONT_SRC" "$APP_FS/DejaVuSans.ttf"
 fi
-rm -f "$HOME/Library/Application Support/Vita3K/Vita3K/logs/SOLOADER0 - [so-loader].log"
+rm -f "$HOME/Library/Application Support/Vita3K/Vita3K/logs/PSVZ00004 - [Zenonia 4].log"
 
 echo "[3/4] Relanzando Vita3K limpio..."
 pkill -9 -x Vita3K 2>/dev/null || true
@@ -60,4 +60,4 @@ CLICK_Y=$((ROW_Y + 38))
 python3 "$SCRIPT_DIR/click_helper.py" "$CLICK_X" "$CLICK_Y" 2
 
 echo "Listo. Log en vivo:"
-echo "  tail -f \"$HOME/Library/Application Support/Vita3K/Vita3K/logs/SOLOADER0 - [so-loader].log\""
+echo "  tail -f \"$HOME/Library/Application Support/Vita3K/Vita3K/logs/PSVZ00004 - [Zenonia 4].log\""

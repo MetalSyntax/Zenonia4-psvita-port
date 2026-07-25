@@ -100,4 +100,27 @@ void gpu_quads_enqueue_text(const unsigned char *alpha, int aw,
 void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, unsigned char a,
                              int screen_x, int screen_y, int w, int h);
 
+// Fase 69 (2026-07-23): borra TODAS las entradas de la cache de texturas
+// (glDeleteTextures + reset de metadata) y el atajo MRU de
+// gpu_quads_enqueue_fill. Llamar en una transicion de stage (ver
+// Zenonia_OnUIStatusChange en java.c, ui_status==19): la cache indexa por
+// puntero de datos + 4 bytes muestreados (gq_hash, Fase 55/56), y el motor
+// reutiliza direcciones de heap recien liberadas para los assets del stage
+// nuevo -- si el contenido nuevo coincide por casualidad en esos 4 bytes con
+// el viejo, gq_find serviría la textura del stage ANTERIOR para sprites
+// completamente distintos. Invalidar en cada transicion elimina esa ventana
+// de colision al costo de un re-decode (barato, ya amortizado en 1-2 frames)
+// de los primeros sprites del stage nuevo.
+void gpu_quads_invalidate_cache(void);
+
+// Fase 77 (2026-07-24): total ACUMULADO de texturas creadas via glGenTextures
+// desde el boot (nunca se resetea, ni siquiera en gpu_quads_invalidate_cache).
+// Expuesto para que main.c lo incluya en su linea periodica de estadisticas
+// (cada 120 frames) -- si el crash determinista de las Fases 72-76 (mismo
+// `.psp2dmp` 5 veces, sobrevivio a batching y a re-bind de textura) resulta
+// correlacionar con un valor sospechoso (ej. cerca de 65536, un limite tipico
+// de handle de 16 bits), seria evidencia real de agotamiento de un recurso
+// interno de vitaGL en vez de otra hipotesis sin confirmar.
+unsigned long gpu_quads_get_total_textures_created(void);
+
 #endif // GPU_QUADS_H

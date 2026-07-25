@@ -127,7 +127,18 @@ void init_log() {
 
 void game_log(const char *fmt, ...) {
     va_list list;
-    char string[512];
+    // Fase 94 (port_progress.md): la linea periodica de "frame N alive" crecio
+    // organicamente durante muchas fases (Fase 27/29/31/36/41/48/77/86/92,
+    // cada una agregando un campo mas) hasta superar los 512 bytes SIN que
+    // nadie lo notara -- vsnprintf trunca en silencio (no hay overflow, pero
+    // tampoco error visible), asi que TODO lo que quedaba despues del corte
+    // (avg_sprite_cache_hits/misses de la Fase 92, y ya desde la Fase 86,
+    // total_texturas_creadas/touch.reportNum/pad.buttons/ui_status) nunca
+    // llego a ningun log real -- confirmado contando bytes contra un log real
+    // del usuario (534/608 caracteres segun la fase, contra el limite de 512).
+    // 2048 da margen real para que la linea siga creciendo varias fases mas
+    // sin repetir este bug.
+    char string[2048];
 
     va_start(list, fmt);
     vsnprintf(string, sizeof(string), fmt, list);
@@ -141,7 +152,7 @@ void game_log(const char *fmt, ...) {
 
 void fatal_error(const char *fmt, ...) {
     va_list list;
-    char string[512];
+    char string[2048]; // Fase 94: mismo motivo que game_log(), ver su comentario
 
     va_start(list, fmt);
     vsnprintf(string, sizeof(string), fmt, list);
@@ -164,7 +175,7 @@ so_module zenonia4_mod;
 // dynlib.c.
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
 	va_list list;
-	char string[512];
+	char string[2048]; // Fase 94: mismo motivo que game_log(), ver su comentario
 
 	va_start(list, fmt);
 	vsnprintf(string, sizeof(string), fmt, list);
@@ -281,6 +292,7 @@ extern volatile unsigned int g_cgxpzxani_draw_calls_this_frame;
 extern volatile unsigned int g_cgxpzxzero_blt_calls_this_frame;
 extern volatile unsigned int g_putcompressimg_calls_this_frame;
 extern volatile unsigned int g_cgsgraphics_calls_this_frame;
+extern void zenonia_log_cgsgraphics_breakdown(unsigned int window_frames);
 extern volatile unsigned int g_dirtyrect_rows_uploaded_this_frame;
 extern volatile unsigned int g_dirtyrect_rows_total_this_frame;
 extern volatile unsigned int g_interlaced_rows_uploaded_this_frame;
@@ -289,6 +301,10 @@ extern volatile unsigned int g_gpu_quads_calls_this_frame;
 extern volatile unsigned int g_gpu_quads_op0_calls_this_frame;
 extern volatile unsigned int g_gpu_quads_cache_hit_this_frame;
 extern volatile unsigned int g_gpu_quads_decoded_this_frame;
+extern volatile unsigned int g_drawtoframebuffer_calls_this_frame;
+extern volatile unsigned int g_sprite_cache_hits_this_frame;
+extern volatile unsigned int g_sprite_cache_misses_this_frame;
+extern void zenonia_install_text_calls_probe(so_module *mod);
 extern void zenonia_install_array_hooks(void);
 extern void zenonia_install_hide_dpad_hook(so_module *mod);
 extern void zenonia_install_drawnative_probe(so_module *mod);
@@ -300,6 +316,8 @@ extern void zenonia_install_screen_fill_quads_hook(so_module *mod);
 extern void zenonia_install_cgsgraphics_probe(so_module *mod);
 extern void zenonia_install_fastclear_optimize(so_module *mod);
 extern void zenonia_install_sprite_decode_optimize(so_module *mod);
+extern void zenonia_install_text_native_optimize(so_module *mod);
+
 
 static GLuint splash_tex = 0;
 
@@ -444,6 +462,14 @@ void gl_init() {
 int main() {
     init_log();
 	game_log("Iniciando Zenonia 4 port (SoLoader)\n");
+#ifdef ZENONIA_BUILD_VARIANT
+	// Fase 85 (port_progress.md): identifica el build variant en la
+	// PRIMERA linea del log (sobrevive incluso a un log cortado a mitad de
+	// sesion) -- antes no habia forma de distinguir p.ej.
+	// --sprite-decode-test de --sprite-decode-exalpha-test desde el log
+	// solo (ningun flag propio deja una linea de instalacion distinta).
+	game_log("[Build] variant=%s\n", ZENONIA_BUILD_VARIANT);
+#endif
 
 	int res = so_file_load(&zenonia4_mod, "ux0:data/zenonia-4/libgameDSO.so", 0x98000000);
 	if (res < 0) {
@@ -513,8 +539,11 @@ int main() {
 		zenonia_install_drawnative_probe(&zenonia4_mod); // ver dynlib.c -- Fase 29, cuenta llamadas a DrawNative (INSTRUMENT_DRAWNATIVE_CALLS)
 		zenonia_install_hotpath_probe(&zenonia4_mod); // ver dynlib.c -- Fase 31, cuenta CGxPZxAni::Draw/CGxPZxZero::Blt/PutCompressImg (INSTRUMENT_HOTPATH_CALLS)
 		zenonia_install_cgsgraphics_probe(&zenonia4_mod); // ver dynlib.c -- Fase 36, cuenta ~13 primitivas de CGsGraphics:: (INSTRUMENT_CGSGRAPHICS_CALLS)
+		zenonia_install_text_calls_probe(&zenonia4_mod); // ver dynlib.c -- Fase 86, cuenta CGxFACharCache::DrawToFrameBuffer (INSTRUMENT_TEXT_CALLS)
 		zenonia_install_fastclear_optimize(&zenonia4_mod); // ver dynlib.c -- Fase 41, reimplementacion real (no solo conteo) de FastClearNonClipping (FASTCLEAR_NEON_OPTIMIZE)
 		zenonia_install_sprite_decode_optimize(&zenonia4_mod); // ver sprite_decode.c -- Fase 43, reemplaza RLE ASM por C nativo
+		zenonia_install_text_native_optimize(&zenonia4_mod); // ver sprite_decode.c -- Fase 87, texto nativo C
+
 #ifdef ZENONIA_GPU_QUADS
 		zenonia_install_text_quads_hook(&zenonia4_mod); // ver dynlib.c -- Fase 59, desvia CGxFACharCache::DrawToFrameBuffer (texto) a la misma cola de quads que los sprites
 		zenonia_install_screen_fill_quads_hook(&zenonia4_mod); // ver dynlib.c -- Fase 61, desvia Screen_RGBBLEND16_Real (rellenos solidos con alpha) a la misma cola de quads
@@ -578,6 +607,9 @@ int main() {
 		unsigned int cgxpzxzero_blt_calls_accum = 0;
 		unsigned int putcompressimg_calls_accum = 0;
 		unsigned int cgsgraphics_calls_accum = 0;
+		unsigned int drawtoframebuffer_calls_accum = 0;
+		unsigned int sprite_cache_hits_accum = 0;
+		unsigned int sprite_cache_misses_accum = 0;
 		unsigned int dirtyrect_rows_uploaded_accum = 0;
 		unsigned int dirtyrect_rows_total_accum = 0;
 		unsigned int interlaced_rows_uploaded_accum = 0;
@@ -586,6 +618,23 @@ int main() {
 		unsigned int gpu_quads_op0_calls_accum = 0;
 		unsigned int gpu_quads_cache_hit_accum = 0;
 		unsigned int gpu_quads_decoded_accum = 0;
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+		// Fase 85 (port_progress.md): metodo NUEVO, no mapeado en
+		// optimization_ideas.md -- ninguna ronda anterior midio DONDE se va
+		// el tiempo DENTRO del frame mas alla del hot path de sprites. El
+		// techo de --skip-blit-test (Fase 47, ~24 FPS/~42ms de frame contra
+		// ~10 FPS/~100ms normal) implica que sacar TODO el blit de sprites
+		// deja ~42ms/frame sin explicar -- podria ser logica de juego/
+		// animacion DENTRO de NativeRender (que fusiona update+draw, motor
+		// tipico de la epoca) o costo FUERA de NativeRender (glClear, splash/
+		// androidui_draw, vglSwapBuffers+vblank). Solo 2 timestamps mas por
+		// frame (sceKernelGetProcessTimeWide, ya usado para el fps de
+		// arriba) -- costo insignificante, NO es logging por-llamada (ver
+		// feedback_no_perf_impact_from_logging en memoria).
+		SceUInt64 frame_phase_cletevent_accum_us = 0;
+		SceUInt64 frame_phase_nativerender_accum_us = 0;
+		SceUInt64 frame_phase_rest_accum_us = 0;
+#endif
 
 		while (1) {
 			sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -627,12 +676,29 @@ int main() {
 				cgxpzxani_draw_calls_accum = 0;
 				cgxpzxzero_blt_calls_accum = 0;
 				putcompressimg_calls_accum = 0;
+				// Fase 86: promedio por frame de llamadas a
+				// CGxFACharCache::DrawToFrameBuffer (texto, INSTRUMENT_TEXT_CALLS,
+				// ver dynlib.c) -- 0.0 siempre en el build normal.
+				float avg_drawtoframebuffer = drawtoframebuffer_calls_accum / 120.0f;
+				drawtoframebuffer_calls_accum = 0;
+				// Fase 92: hit/miss de la cache de sprites COPY (SPRITE_DECODE_CACHE,
+				// ver sprite_decode.c) -- 0.0 en ambas si el flag esta OFF. El dato
+				// que decide si esta cache vale la pena en combate real.
+				float avg_sprite_cache_hits = sprite_cache_hits_accum / 120.0f;
+				float avg_sprite_cache_misses = sprite_cache_misses_accum / 120.0f;
+				sprite_cache_hits_accum = 0;
+				sprite_cache_misses_accum = 0;
 				// Fase 36: promedio por frame del contador agregado sobre las
 				// ~13 primitivas de CGsGraphics:: instrumentadas
 				// (INSTRUMENT_CGSGRAPHICS_CALLS, ver dynlib.c) -- 0.0 siempre
 				// en el build normal.
 				float avg_cgsgraphics = cgsgraphics_calls_accum / 120.0f;
 				cgsgraphics_calls_accum = 0;
+				// Desglose por primitiva (dynlib.c) -- 0.0 en todas si
+				// INSTRUMENT_CGSGRAPHICS_CALLS esta OFF, mismo criterio que
+				// avg_cgsgraphics de arriba. Linea separada para no romper
+				// el parseo de la linea "frame N alive" existente.
+				zenonia_log_cgsgraphics_breakdown(120);
 				// Fase 36: porcentaje de filas del framebuffer RGB565
 				// realmente subidas vs. las que se hubieran subido sin el
 				// diffing de DIRTY_RECT_UPLOAD (ver dynlib.c) -- 0.0/sin
@@ -665,8 +731,44 @@ int main() {
 				gpu_quads_op0_calls_accum = 0;
 				gpu_quads_cache_hit_accum = 0;
 				gpu_quads_decoded_accum = 0;
-				game_log("frame %d alive, fps=%.1f avg_rgb565_uploads_per_frame=%.1f avg_drawnative_calls_per_frame=%.1f avg_cgxpzxani_draw_per_frame=%.1f avg_cgxpzxzero_blt_per_frame=%.1f avg_putcompressimg_per_frame=%.1f avg_cgsgraphics_per_frame=%.1f avg_dirtyrect_pct_uploaded=%.1f avg_interlaced_pct_uploaded=%.1f avg_gpu_quads_calls_per_frame=%.1f avg_gpu_quads_op0_per_frame=%.1f avg_gpu_quads_hit_per_frame=%.1f avg_gpu_quads_decoded_per_frame=%.1f touch.reportNum=%d pad.buttons=0x%08x ui_status=%d\n",
-					frame, fps, avg_uploads, avg_drawnative, avg_ani_draw, avg_zero_blt, avg_putcompress, avg_cgsgraphics, avg_dirtyrect_pct, avg_interlaced_pct, avg_gpu_quads_calls, avg_gpu_quads_op0, avg_gpu_quads_hit, avg_gpu_quads_decoded, touch.reportNum, (unsigned int) pad.buttons, g_ui_status);
+#ifdef ZENONIA_GPU_QUADS
+				// Fase 77 (2026-07-24): total acumulado de texturas creadas
+				// desde el boot, nunca reseteado -- para correlacionar con el
+				// crash determinista de las Fases 72-76 (mismo .psp2dmp 5
+				// veces, sobrevivio a batching y a re-bind de textura) sin
+				// tener que esperar a un evento "frame pesado"/"cache
+				// invalidada" -- siempre hay una lectura reciente cerca de
+				// cualquier crash.
+				unsigned long total_tex = gpu_quads_get_total_textures_created();
+#else
+				unsigned long total_tex = 0;
+#endif
+				game_log("frame %d alive, fps=%.1f avg_rgb565_uploads_per_frame=%.1f avg_drawnative_calls_per_frame=%.1f avg_cgxpzxani_draw_per_frame=%.1f avg_cgxpzxzero_blt_per_frame=%.1f avg_putcompressimg_per_frame=%.1f avg_drawtoframebuffer_per_frame=%.1f avg_cgsgraphics_per_frame=%.1f avg_dirtyrect_pct_uploaded=%.1f avg_interlaced_pct_uploaded=%.1f avg_gpu_quads_calls_per_frame=%.1f avg_gpu_quads_op0_per_frame=%.1f avg_gpu_quads_hit_per_frame=%.1f avg_gpu_quads_decoded_per_frame=%.1f avg_sprite_cache_hits_per_frame=%.1f avg_sprite_cache_misses_per_frame=%.1f total_texturas_creadas=%lu touch.reportNum=%d pad.buttons=0x%08x ui_status=%d\n",
+					frame, fps, avg_uploads, avg_drawnative, avg_ani_draw, avg_zero_blt, avg_putcompress, avg_drawtoframebuffer, avg_cgsgraphics, avg_dirtyrect_pct, avg_interlaced_pct, avg_gpu_quads_calls, avg_gpu_quads_op0, avg_gpu_quads_hit, avg_gpu_quads_decoded, avg_sprite_cache_hits, avg_sprite_cache_misses, total_tex, touch.reportNum, (unsigned int) pad.buttons, g_ui_status);
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+				// Fase 85: desglose de DONDE se va el tiempo dentro del frame --
+				// ver comentario junto a los accum de arriba. 0.0 en todas si
+				// INSTRUMENT_FRAME_PHASES esta OFF (nunca se acumula nada).
+				game_log("[FramePhases] avg ms/frame (ultimos 120): handleCletEvent=%.2f NativeRender=%.2f resto(glClear+splash+androidui+swap+vblank)=%.2f\n",
+					frame_phase_cletevent_accum_us / 120.0f / 1000.0f,
+					frame_phase_nativerender_accum_us / 120.0f / 1000.0f,
+					frame_phase_rest_accum_us / 120.0f / 1000.0f);
+				frame_phase_cletevent_accum_us = 0;
+				frame_phase_nativerender_accum_us = 0;
+				frame_phase_rest_accum_us = 0;
+#endif
+				// Fase 71 (2026-07-23): game_log() no hace fflush por linea (ver
+				// su propio comentario -- eso costaba 10 FPS reales). Efecto
+				// colateral confirmado con 2 logs de usuario reales seguidos:
+				// si se extrae el archivo por FTP con el juego TODAVIA corriendo
+				// (sin cerrarlo, que es el unico lugar que hace fclose), el
+				// contenido mas reciente queda atrapado en el buffer de stdio y
+				// nunca llega al archivo -- ambos logs cortaban a mitad de linea,
+				// exactamente antes del evento que se pedia diagnosticar. Este
+				// bloque ya corre una vez cada 120 frames (~cada 6-10s a este
+				// FPS) -- un fflush() aca cuesta 1 syscall cada varios segundos,
+				// nada que ver con el cuello de botella de flushear cada linea.
+				if (log_file) fflush(log_file);
 			}
 
 			// Salida de emergencia: START+SELECT juntos
@@ -828,14 +930,23 @@ int main() {
 				last_touch_suppressed = 0;
 			}
 
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+			SceUInt64 fp_frame_start = sceKernelGetProcessTimeWide();
+#endif
 			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 			glClear(GL_COLOR_BUFFER_BIT);
 
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+			SceUInt64 fp_before_clet = sceKernelGetProcessTimeWide();
+#endif
 			if (handleCletEvent && eq_head != eq_tail) {
 				input_event *ev = &event_queue[eq_head];
 				eq_head = (eq_head + 1) % 16;
 				handleCletEvent(jniEnv, NULL, ev->type, ev->p1, ev->p2, ev->p3);
 			}
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+			SceUInt64 fp_after_clet = sceKernelGetProcessTimeWide();
+#endif
 
 #ifdef ZENONIA_GPU_QUADS
 			// Variante 2 (Fase 50): los quads se dibujan en glDrawArrays_wrapper
@@ -843,6 +954,11 @@ int main() {
 			// hay nada que hacer.
 #endif
 			if (NativeRender) NativeRender(jniEnv, NULL);
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+			SceUInt64 fp_after_render = sceKernelGetProcessTimeWide();
+			frame_phase_cletevent_accum_us += (fp_after_clet - fp_before_clet);
+			frame_phase_nativerender_accum_us += (fp_after_render - fp_after_clet);
+#endif
 			rgb565_upload_accum += g_rgb565_uploads_this_frame;
 			g_rgb565_uploads_this_frame = 0;
 			drawnative_calls_accum += g_drawnative_calls_this_frame;
@@ -853,6 +969,12 @@ int main() {
 			g_cgxpzxzero_blt_calls_this_frame = 0;
 			putcompressimg_calls_accum += g_putcompressimg_calls_this_frame;
 			g_putcompressimg_calls_this_frame = 0;
+			drawtoframebuffer_calls_accum += g_drawtoframebuffer_calls_this_frame;
+			g_drawtoframebuffer_calls_this_frame = 0;
+			sprite_cache_hits_accum += g_sprite_cache_hits_this_frame;
+			g_sprite_cache_hits_this_frame = 0;
+			sprite_cache_misses_accum += g_sprite_cache_misses_this_frame;
+			g_sprite_cache_misses_this_frame = 0;
 			cgsgraphics_calls_accum += g_cgsgraphics_calls_this_frame;
 			g_cgsgraphics_calls_this_frame = 0;
 			dirtyrect_rows_uploaded_accum += g_dirtyrect_rows_uploaded_this_frame;
@@ -891,6 +1013,18 @@ int main() {
 #ifndef ZENONIA_DISABLE_VSYNC
             // Forzar limite a 30 FPS (esperar un vblank extra, ya que vglSwapBuffers espera el primero)
             sceDisplayWaitVblankStart();
+#endif
+#ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
+			// "rest" = todo lo que NO es handleCletEvent ni NativeRender:
+			// sceCtrlPeekBufferPositive/sceTouchPeek del tope del loop, el
+			// checkpoint de cada 120 frames, glClear, splash_draw/androidui_draw,
+			// vglSwapBuffers + la espera de vblank. Por resta en vez de mas
+			// timestamps -- ya cubre TODO lo que queda del frame.
+			SceUInt64 fp_frame_end = sceKernelGetProcessTimeWide();
+			SceUInt64 fp_total = fp_frame_end - fp_frame_start;
+			SceUInt64 fp_clet = fp_after_clet - fp_before_clet;
+			SceUInt64 fp_render = fp_after_render - fp_after_clet;
+			frame_phase_rest_accum_us += (fp_total > fp_clet + fp_render) ? (fp_total - fp_clet - fp_render) : 0;
 #endif
 		}
 	}

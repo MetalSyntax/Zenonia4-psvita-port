@@ -2,8 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**This file describes the CURRENT, ACTIVE state of the port** (updated 2026-07-21, up through
-`port_progress.md` Fase 68). For the full phase-by-phase history of every bug found/fixed and every
+**This file describes the CURRENT, ACTIVE state of the port** (updated 2026-07-25, up through
+`port_progress.md` Fase 94). For the full phase-by-phase history of every bug found/fixed and every
 build variant tried, `port_progress.md` is authoritative — this file is an orientation map, not a
 replacement for it.
 
@@ -71,32 +71,55 @@ Layout:
   of historical interest now that the ideas in them have been tried (see `port_progress.md` for
   results).
 
-## Where things stand (as of Fase 68)
+## Where things stand (as of Fase 94)
 
-The port is playable end-to-end: boots, renders, takes touch input, plays audio, saves/loads. The
-current active development effort is **Variante 2, `--gpu-quads-test`**
-(`build/zenonia_4_gpu_quads_test.vpk`) — offloading the engine's software-rendered sprites to GPU
-quads via vitaGL for a real, measured FPS win, while chasing down graphical regressions the offload
-introduced. The recurring bug family in this arc: several engine draw paths (sprite blits, text
-glyphs, solid-color UI fills, rounded-rect corners) write **directly into the software framebuffer**,
-bypassing the one function (`PutCompressImg`) originally hooked to divert content to GPU quads — so
-anything using one of those paths gets visually buried under GPU-quad content drawn in the same frame,
-regardless of the engine's real intended order. Each instance found so far got the same fix: hook the
-real underlying function, convert its draw call into a quad, enqueue it into the *same* ordered quad
-queue as sprites. Confirmed instances: text (`CGxFACharCache::DrawToFrameBuffer`), solid alpha fills
-(`Screen_RGBBLEND16_Real`), rounded-corner fills (`DrawNativeFillEllipse`, gated to real rounded-rect
-corners only). **Still open**: an in-game-only variant of the missing-background bug (item pickup /
-save / tip dialogs during actual gameplay, as opposed to the pause menu, which works) whose exact cause
-is still being isolated via console-log diagnostics; map character/portal icons not rendering; a
-narrower text-cache-staleness report in one pause-menu popup. See `port_progress.md` Fase 63 onward for
-the detailed, current diagnosis-in-progress.
+The port is playable end-to-end: boots, renders, takes touch input, plays audio, saves/loads, at a
+**confirmed real ceiling of ~24 FPS for any 100%-CPU rendering approach** (`--skip-blit-test` measured
+this with sprite drawing disabled entirely — real gameplay, with sprites actually drawn, lands
+somewhere below that). The default build (`./build.sh`, no flag) currently runs ~9-10 FPS and is the
+**recommended build for actually playing** — stable, no known crash/hang risk.
+
+**GPU_QUADS (`--gpu-quads-test`) is PAUSED, not just "experimental"** — it is the only approach that's
+shown FPS beyond the CPU ceiling in practice (13-15 FPS measured), but it has a **confirmed, still-
+unexplained, deterministic crash** (`PC=0x0` inside vitaGL's own `_glTexSubImage2D`, always during the
+engine's framebuffer upload — 6 identical `.psp2dmp`, 5 real hypotheses ruled out with hardware data:
+draw-call volume, wrong texture bound, texture-count exhaustion, VSync, RGB565 format specifically) AND
+has **hung the entire console twice** (not just crashed the app — no `.psp2dmp`, requires a hard
+power-cycle): once with `DISABLE_VSYNC+GPU_QUADS` together (never combine these again), and once from a
+`glGetIntegerv` diagnostic call added mid-investigation (reverted). Do not build/ship anything under
+`GPU_QUADS` without treating it as actively dangerous to the console, not merely buggy — see
+`port_progress.md` Fase 72-91 for the full crash-chasing history and Fase 90 for the one genuinely new
+lead (real vitaGL source, fetched from GitHub, pins the exact NULL-pointer mechanism — still needs a
+crash-safe way to confirm which texture is actually bound at the crash moment).
+
+Recent work (Fase 83-94, all CPU-side, GPU_QUADS-independent) chased the ~24 FPS ceiling with several
+optimizations, all gated behind their own `option()`/build.sh flag, all requiring `SPRITE_DECODE_OPTIMIZE`
+except where noted: `SPRITE_DECODE_EX_ALPHA` (native text-blend RLE variant, `--sprite-decode-exalpha-test`,
+less-verified), `SPRITE_DECODE_CACHE` (CPU decode cache for repeat sprites, `--sprite-decode-cache-test`,
+**the one candidate that changes the approach — avoids redundant work instead of just speeding up the
+same work — still pending a real combat-session measurement of its hit rate**), `TEXT_NATIVE_OPTIMIZE`
+(native text blend, `--text-native-optimize-test`, low expected impact — text is called only ~10-18
+times/frame). Recompiling the same algorithm in modern ARMv7 C (vs. the original ARMv5) has NOT shown a
+measurable FPS gain anywhere it's been tried (sprites, confirmed Fase 85) — the bottleneck is memory-
+bandwidth/volume-bound, not codegen-quality-bound. Diagnostic-only additions: `INSTRUMENT_FRAME_PHASES`
+(`--frame-phases-probe`, confirmed 90-96% of frame time is inside the engine's own `NativeRender`, only
+4-10% outside it — rules out any optimization outside that call), `INSTRUMENT_TEXT_CALLS`
+(`--text-calls-probe`), and `INSTRUMENT_CGSGRAPHICS_CALLS` (`--cgsgraphics-probe`, real combat data shows
+`DrawFillRect` at only 3-14 calls/frame — 30-150x less frequent than the sprite hot path, so a GPU
+offload of solid-color fills is very unlikely to move FPS meaningfully even if built).
+
+**Known bug, fixed Fase 94**: `game_log()`'s internal buffer was 512 bytes; the periodic "frame N alive"
+diagnostic line grew past that (silently, over several phases) and got truncated by `vsnprintf` with no
+warning — several `avg_*_per_frame` fields (including the sprite-cache hit/miss counters) were silently
+missing from every log since Fase 86. Fixed by bumping the buffer to 2048. If you add more fields to that
+one line in the future, mind the total length again.
 
 Other build variants exist for performance experimentation (see `build.sh`'s own header comment for
-the full list with rationale): `--neon-fallback`, `--sprite-decode-test`, `--fastclear-neon-test`,
-`--downsample-test`, `--primitives-opt-test`, several `--*-probe`/`--*-test` diagnostic-only builds.
-The **default build** (`./build.sh`, no flag) is the stable baseline: `RGB565_DIRECT_UPLOAD=ON`
-(confirmed real FPS win, no color regressions), everything else off. GPU_QUADS is NOT on by default —
-it's an experimental variant, opt in via `--gpu-quads-test` explicitly.
+the full list with rationale, ~30 flags total at this point): `--neon-fallback`, `--fastclear-neon-test`,
+`--downsample-test` (confirmed dead end — zooms the view, no FPS/visual change), `--primitives-opt-test`,
+several `--*-probe`/`--*-test` diagnostic-only builds. GPU_QUADS is NOT on by default and should not be
+enabled for anything other than continued crash investigation with full awareness of the console-hang
+risk above.
 
 ## Build
 

@@ -141,6 +141,31 @@ if (INSTRUMENT_CGSGRAPHICS_CALLS)
   add_definitions(-DZENONIA_INSTRUMENT_CGSGRAPHICS=1)
 endif()
 
+## Fase 85 (port_progress.md): metodo NUEVO, no mapeado en optimization_ideas.md.
+## El techo de --skip-blit-test (Fase 47, ~24 FPS/~42ms de frame vs ~10 FPS/~100ms
+## normal) implica que sacar TODO el blit de sprites deja ~42ms/frame sin explicar
+## -- nunca se midio DONDE se va ese tiempo (dentro de NativeRender, que fusiona
+## update+draw, o fuera: glClear/splash/androidui/vglSwapBuffers+vblank). Solo
+## bracketa con sceKernelGetProcessTimeWide() (ya usado para el fps de siempre)
+## alrededor de handleCletEvent y NativeRender, una vez por frame -- NO agrega
+## logging por-llamada, costo insignificante frente al frame completo.
+option(INSTRUMENT_FRAME_PHASES "Measure wall-clock time spent in handleCletEvent / NativeRender / everything else, once per frame via sceKernelGetProcessTimeWide (diagnostic, negligible overhead -- unlike other INSTRUMENT_* flags this one IS safe to judge relative timing from)" OFF)
+if (INSTRUMENT_FRAME_PHASES)
+  add_definitions(-DZENONIA_INSTRUMENT_FRAME_PHASES=1)
+endif()
+
+## Fase 86 (port_progress.md): --frame-phases-probe (arriba) mostro que la
+## pantalla de MENU (sin sprites de gameplay) ya costaba 87ms de NativeRender,
+## casi tanto como el gameplay real (149-152ms) -- un menu es mayormente
+## texto/UI, candidato directo: CGxFACharCache::DrawToFrameBuffer (confirmado
+## en la Fase 59 que dibuja texto DIRECTO al framebuffer, nunca medido por su
+## COSTO, solo tocado antes para arreglar capas visuales bajo GPU_QUADS).
+## Conteo pass-through, INDEPENDIENTE de GPU_QUADS (no reemplaza el dibujo).
+option(INSTRUMENT_TEXT_CALLS "Count calls to CGxFACharCache::DrawToFrameBuffer (text rendering) per frame via a pass-through hook (diagnostic only, adds real per-call overhead -- do not use to judge FPS)" OFF)
+if (INSTRUMENT_TEXT_CALLS)
+  add_definitions(-DZENONIA_INSTRUMENT_TEXT_CALLS=1)
+endif()
+
 ## Fase 41 (port_progress.md), "Lo que NO se ha hecho" #3: reimplementacion
 ## REAL (no solo conteo) de CGsGraphics::FastClearNonClipping, confirmada
 ## fiel contra su pseudo-C real en out_ghidra.c (ver dynlib.c
@@ -167,6 +192,68 @@ endif()
 option(SPRITE_DECODE_OPTIMIZE "Replace ARMv5 RLE assembly with Vita native optimized C code for drawing sprites" OFF)
 if (SPRITE_DECODE_OPTIMIZE)
   add_definitions(-DZENONIA_SPRITE_DECODE_OPTIMIZE=1)
+endif()
+
+## Fase 87/89 (port_progress.md): reemplaza CGxFACharCache::DrawToFrameBuffer
+## (blend de texto por pixel) por C nativo recompilado para ARMv7 -- MISMO
+## patron que SPRITE_DECODE_OPTIMIZE (Fase 43), NO "elude un emulador ARM": el
+## .so corre codigo ARM NATIVO en la CPU real de la Vita (soloader, sin
+## interpretacion), la ganancia esperada es SOLO de mejor codegen/scheduling
+## para un core Cortex-A9 moderno -- y Fase 85 ya midio que ese mismo tipo de
+## recompilacion (SPRITE_DECODE_OPTIMIZE en aislamiento) NO dio mejora de FPS
+## medible, asi que no hay base real para esperar una ganancia "masiva" aca
+## tampoco (ver Fase 89). Default OFF -- como CUALQUIER otra optimizacion
+## experimental de este archivo, hasta confirmar en consola real. Requiere
+## SPRITE_DECODE_OPTIMIZE (comparten el mismo `zenonia_install_*`
+## call-site en main.c, mismo criterio que SPRITE_DECODE_EX_ALPHA/_CACHE).
+option(TEXT_NATIVE_OPTIMIZE "Replace CGxFACharCache::DrawToFrameBuffer (text blend) with native C code (experimental, not yet measured on hardware, no evidence to expect a large FPS win -- see port_progress.md Fase 89)" OFF)
+if (TEXT_NATIVE_OPTIMIZE)
+  if (NOT SPRITE_DECODE_OPTIMIZE)
+    message(FATAL_ERROR "TEXT_NATIVE_OPTIMIZE requiere SPRITE_DECODE_OPTIMIZE=ON (mismo install call-site en main.c)")
+  endif()
+  add_definitions(-DZENONIA_TEXT_NATIVE_OPTIMIZE=1)
+endif()
+if (TEXT_NATIVE_OPTIMIZE AND GPU_QUADS)
+  message(FATAL_ERROR "TEXT_NATIVE_OPTIMIZE y GPU_QUADS no pueden estar ON a la vez -- ambos instalan un hook sobre el mismo simbolo (CGxFACharCache::DrawToFrameBuffer); GPU_QUADS ya lo maneja con su propio mecanismo (Fase 59)")
+endif()
+if (TEXT_NATIVE_OPTIMIZE AND INSTRUMENT_TEXT_CALLS)
+  message(FATAL_ERROR "TEXT_NATIVE_OPTIMIZE e INSTRUMENT_TEXT_CALLS no pueden estar ON a la vez -- ambos instalan un hook sobre el mismo simbolo (CGxFACharCache::DrawToFrameBuffer)")
+endif()
+
+## Fase 83: extiende SPRITE_DECODE_OPTIMIZE a la variante de header -6
+## (DrawOP_COPY_Compress_16_Ex_Alpha, alpha-blend por pixel) -- SEPARADA de
+## SPRITE_DECODE_OPTIMIZE a proposito (no fusionada en el mismo define) porque
+## tiene MENOS certeza de reverse-engineering que el camino generico: Ghidra
+## no deja ver la tabla de datos real que el motor usa para despachar headers
+## en [-7,-3], asi que no se puede confirmar con la misma certeza que -6
+## realmente cae en esta rutina (y no en DrawOP_COPY_Compress_16_Ex, que
+## tambien chequea header==-6 internamente) para el draw-op COPY -- ver
+## comentario junto a DrawOP_COPY_Compress_16_Ex_Alpha_Vita en sprite_decode.c.
+## Requiere SPRITE_DECODE_OPTIMIZE=ON (el hook que reemplaza el puntero COPY
+## vive ahi).
+option(SPRITE_DECODE_EX_ALPHA "Also replace header -6 (DrawOP_COPY_Compress_16_Ex_Alpha, per-pixel alpha blend) with native C -- requires SPRITE_DECODE_OPTIMIZE, LESS verified than the generic path (see sprite_decode.c comment)" OFF)
+if (SPRITE_DECODE_EX_ALPHA)
+  if (NOT SPRITE_DECODE_OPTIMIZE)
+    message(FATAL_ERROR "SPRITE_DECODE_EX_ALPHA requiere SPRITE_DECODE_OPTIMIZE=ON")
+  endif()
+  add_definitions(-DZENONIA_SPRITE_DECODE_EX_ALPHA=1)
+endif()
+
+## Fase 83, candidato 4 (threading acotado) reencuadrado como cache de CPU:
+## PutCompressImg SI recibe w/h explicitos (CGxPZxZero::Blt los resuelve desde
+## el propio sprite, out_ghidra.c:247337-247381/243641) aunque el decodificador
+## RLE de bajo nivel no los tenga (Fase 43) -- eso habilita decodificar cada
+## sprite COPY UNA vez a un buffer propio (mas una mascara de "pixel
+## realmente escrito") y reusarlo en encuentros siguientes, sin GPU/vitaGL/
+## threads (el usuario eligio la version mas simple: mismo hilo). Ver
+## comentario extenso en loader/sprite_decode.c. Requiere SPRITE_DECODE_OPTIMIZE
+## (el hook de COPY vive ahi).
+option(SPRITE_DECODE_CACHE "Cache decoded COPY sprites in CPU memory keyed by source pointer, skipping re-decode on repeat draws -- requires SPRITE_DECODE_OPTIMIZE, no GPU/threading involved" OFF)
+if (SPRITE_DECODE_CACHE)
+  if (NOT SPRITE_DECODE_OPTIMIZE)
+    message(FATAL_ERROR "SPRITE_DECODE_CACHE requiere SPRITE_DECODE_OPTIMIZE=ON")
+  endif()
+  add_definitions(-DZENONIA_SPRITE_DECODE_CACHE=1)
 endif()
 
 
@@ -226,6 +313,9 @@ option(GPU_QUADS "Offload COPY sprites to GPU textured quads via vitaGL with a d
 if (GPU_QUADS)
   add_definitions(-DZENONIA_GPU_QUADS=1)
 endif()
+if (GPU_QUADS AND INSTRUMENT_TEXT_CALLS)
+  message(FATAL_ERROR "GPU_QUADS e INSTRUMENT_TEXT_CALLS no pueden estar ON a la vez -- ambos instalan un hook sobre el mismo simbolo (CGxFACharCache::DrawToFrameBuffer)")
+endif()
 
 ## Variante 3 (--downsample-test, 2026-07-19): resolucion INTERNA reducida
 ## (GAME_W/H = 960x544 * DS_NUM/DS_DEN) con upscale por GPU. AVISO: este motor
@@ -245,6 +335,15 @@ endif()
 ## para el build de respaldo NEON (ver build.sh --neon-fallback) o los de
 ## diagnostico (ver build.sh --drawnative-probe / --hotpath-probe).
 set(VPK_OUTPUT_NAME "zenonia_4" CACHE STRING "Base filename for the generated .self/.vpk")
+## Fase 85 (port_progress.md, 2026-07-24): el usuario recibio 4 logs de 4 VPKs
+## distintos y no pudo mapear con certeza cuales correspondian a cual build
+## (varios flags -- p.ej. --sprite-decode-test vs --sprite-decode-exalpha-test --
+## no dejan NINGUNA linea de log que los distinga entre si). Expone
+## VPK_OUTPUT_NAME (que ya identifica el build de forma unica, un valor por
+## cada rama de build.sh) como un define de texto para que main.c lo imprima
+## UNA vez al arrancar -- resuelve esto para TODOS los builds presentes y
+## futuros, no solo los de esta ronda.
+add_definitions(-DZENONIA_BUILD_VARIANT="${VPK_OUTPUT_NAME}")
 if (NOT RGB565_DIRECT_UPLOAD)
   set(VITA_APP_NAME "${VITA_APP_NAME} [NEON fallback]")
 elseif (INSTRUMENT_DRAWNATIVE_CALLS)

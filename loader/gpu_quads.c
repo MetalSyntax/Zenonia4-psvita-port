@@ -6,11 +6,21 @@
 
 #include <vitaGL.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "gpu_quads.h"
 
 extern void game_log(const char *fmt, ...);
+// Fase 74 (2026-07-23): 3 logs de usuario seguidos cortaron a mitad de linea
+// justo en el desglose "frame pesado" -- un crash real vacia lo que quedo sin
+// flushear en el buffer de stdio (ver Fase 71, que ya lo confirmo para logs
+// pulled en caliente; un crash es el mismo problema pero SIN ventana de
+// reintento). El flush periodico cada 120 frames (Fase 71) no alcanza a
+// tiempo si el crash pasa DENTRO de esos 120 frames -- flushear justo despues
+// de un diagnostico raro y de alto valor (no cada frame) es barato y cierra
+// el hueco para este caso especifico.
+extern FILE *log_file;
 
 // ---- proyeccion ----
 static int g_screen_w = 960;
@@ -43,21 +53,205 @@ static gq_entry g_cache[GPU_QUADS_CACHE_CAP];
 static int g_cache_count = 0;
 static int g_evict_ring = 0;
 
+// Fase 77 (2026-07-24): el crash determinista (5 `.psp2dmp` identicos)
+// sobrevivio tanto al batching (Fase 75, descarta "volumen de draw calls")
+// como al re-bind de textura del motor (Fase 76, descarta "textura equivocada
+// bindeada al momento de la subida del FB"). Hipotesis nueva, todavia sin
+// confirmar: vitaGL podria tener algun limite interno (un handle de 16 bits,
+// una tabla de tamano fijo, etc.) sobre el TOTAL ACUMULADO de texturas
+// creadas via glGenTextures a lo largo de TODA la sesion -- no por frame,
+// que ya se conto y no explico nada (Fase 72-74 -- miss/decode-nuevo por
+// frame es chico, unas pocas decenas como mucho). Este contador acumula
+// TODAS las texturas creadas por gpu_quads.c desde el boot (nunca se
+// resetea) para poder correlacionar su valor real con el momento del proximo
+// crash -- si el numero al crashear ronda una potencia de 2 sospechosa
+// (65536 = limite tipico de un handle de 16 bits, u otro), seria evidencia
+// directa en vez de otra hipotesis a ciegas.
+static unsigned long g_total_textures_created = 0;
+
+// Fase 69: atajo MRU de gpu_quads_enqueue_fill (antes local a esa funcion) --
+// promovido a file-scope para que gpu_quads_invalidate_cache() pueda
+// resetearlo junto con el resto de la cache (si no, sobreviviria a la
+// invalidacion apuntando a una gq_entry que ya fue borrada/reusada).
+static int g_fill_mru_key = -1;
+static gq_entry *g_fill_mru_entry = NULL;
+
 // ---- cola de quads por frame ----
 // Fase 61: w,h propios del quad (no siempre e->w/e->h) -- necesario para
 // gpu_quads_enqueue_fill(), donde una textura de 1x1 cacheada por color se
 // estira a CUALQUIER tamano de pantalla (un relleno solido no tiene "tamano
 // decodificado" propio, a diferencia de un sprite/glifo).
-#define GPU_QUADS_QUEUE_CAP 8192
-typedef struct { gq_entry *e; float x, y, w, h; } gq_quad;
+// Fase 69: `tex` se captura AQUI (al encolar), no se guarda un puntero al
+// gq_entry para leer despues en el flush. Motivo (bug real encontrado por
+// revision de codigo, no por un log nuevo): con la cache llena (confirmado en
+// consola, `logs/log_1784597812.txt`, Fase 65 -- "cache llena" se dispara 40
+// veces reales en una sesion con mucho detalle de mapa/sprites nuevos),
+// `gq_insert_slot` recicla el slot MAS VIEJO en anillo (`g_evict_ring`) sin
+// importar si ese slot todavia esta referenciado por un quad YA encolado en
+// ESTE MISMO frame (uno de los `enqueue` de mas abajo corrio antes en el
+// mismo frame y guardo un puntero al gq_entry). Si eso pasa, cuando
+// gpu_quads_flush() finalmente dibuja, dos quads distintos de este frame
+// terminan apuntando al MISMO gq_entry -- el mas viejo (que deberia dibujar
+// un sprite A) se dibuja con la textura de lo ultimo que reciclo ese slot
+// (un sprite B totalmente distinto, decodificado DESPUES en el mismo frame),
+// mientras conserva el tamano/posicion originales de A. Un stage nuevo con
+// muchos sprites nunca vistos (tileset/personajes/fondos) es exactamente el
+// escenario que satura la cache y dispara reciclado en rafaga dentro de un
+// mismo frame -- candidato fuerte para "la pantalla se distorsiona por
+// completo" al cambiar de escenario. Fix: cada quad guarda su PROPIO GLuint
+// de textura al encolarse (inmutable de ahi en mas), en vez de un puntero
+// compartido a una entrada de cache que puede reciclarse debajo suyo antes
+// del flush.
+// Fase 70 (2026-07-23): reporte de usuario -- distorsion tras cambiar de
+// stage una SEGUNDA vez. El log adjunto (log_1784849225.txt) no llego a
+// capturar ese evento (corta a mitad de linea, sesion todavia viva), pero
+// confirmo con los propios numeros del diagnostico de panel (Fase 66/67) que
+// esta cola SI llego a llenarse por completo al menos una vez en consola real
+// (dos entradas con `idx + residual + 1 == 8192`, el cap exacto de entonces).
+// Con la cola llena, las 4 funciones de encolado de abajo descartaban
+// contenido en silencio (a diferencia de gq_insert_slot, que SI loguea
+// "cache llena") -- cualquier sprite/relleno/texto que no entraba ese frame
+// quedaba SOLO en el framebuffer de software, debajo de TODOS los quads (el
+// mismo sintoma de "contenido tapado" de fases anteriores, pero por volumen
+// real en escenas densas, no por un puntero stale). Cap subido con margen y
+// agregado un log limitado para confirmar (o descartar) si esto recurre.
+#define GPU_QUADS_QUEUE_CAP 16384
+typedef struct { GLuint tex; float x, y, w, h; } gq_quad;
 static gq_quad gq_quads[GPU_QUADS_QUEUE_CAP];
 static int gq_quads_count = 0;
+
+// Fase 72 (2026-07-23): un .psp2dmp real (crash dentro de la propia
+// `_glTexSubImage2D` de vitaGL, PC=0x0 -- un puntero a funcion interno nulo)
+// aparecio en el MISMO frame que la cola se lleno del todo (Fase 70/71,
+// `idx + residual + 1 == GPU_QUADS_QUEUE_CAP` exacto, ahora con 16384).
+// Sospecha: algun (op) especifico genera un numero sin limite de quads en un
+// solo frame -- posiblemente porque su `p8` (o el puntero `data`) cambia en
+// CADA llamada, derrotando la cache (Fase 55) y forzando un `glGenTextures`/
+// `glTexImage2D` nuevo por cada uno, agotando algun recurso interno de
+// vitaGL a mitad de frame y corrompiendo su estado para la subida del
+// framebuffer base que corre despues. Diagnostico: cuenta llamadas de
+// encolado POR (op) durante el frame actual (hit vs miss/decode nuevo); si
+// el frame termina "pesado" (por encima de GQ_HEAVY_FRAME_THRESHOLD),
+// `gpu_quads_flush()` vuelca el desglose antes de resetear.
+// Fase 73 (2026-07-23): la Fase 72 confirmo que el frame pesado es CASI TODO
+// cache-hit (miss~0) para los 2 ops dominantes -- descarta "se crean muchas
+// texturas nuevas" como mecanismo principal. Falta saber si es LA MISMA
+// sprite/color repetida miles de veces (loop real redibujando lo mismo) o
+// contenido genuinamente distinto cada vez (una cache-hit no implica que la
+// clave sea igual a la anterior). Se agrega una clave liviana por llamada
+// (para sprites: puntero data ^ p8; para rellenos/texto: el mismo `p8`
+// combinado que ya arma el caller) y se trackea, por op: la corrida mas larga
+// de llamadas CONSECUTIVAS con la MISMA clave (`max_run`) y hasta 8 claves
+// DISTINTAS vistas (`distinct`, capado -- si se pasa de 8 ya es evidencia de
+// "muchas cosas distintas", no hace falta contar mas). Un `max_run` alto (o
+// `distinct` bajo con count alto) es evidencia directa de un loop
+// redibujando lo mismo; `distinct` alto seria lo contrario.
+#define GQ_OP_TRACK_CAP 32
+#define GQ_OP_TRACK_SEEN_CAP 8
+#define GQ_HEAVY_FRAME_THRESHOLD 4000
+typedef struct {
+    int op;
+    int count;
+    int miss;
+    unsigned long last_key;
+    int cur_run;
+    int max_run;
+    unsigned long seen_keys[GQ_OP_TRACK_SEEN_CAP];
+    int distinct;
+} gq_op_track_t;
+static gq_op_track_t g_op_track[GQ_OP_TRACK_CAP];
+static int g_op_track_n = 0;
+
+static void gq_track_op(int op, int is_miss, unsigned long key) {
+    gq_op_track_t *t = NULL;
+    for (int i = 0; i < g_op_track_n; i++) {
+        if (g_op_track[i].op == op) { t = &g_op_track[i]; break; }
+    }
+    if (!t) {
+        if (g_op_track_n >= GQ_OP_TRACK_CAP) return;
+        t = &g_op_track[g_op_track_n++];
+        t->op = op;
+        t->count = 0;
+        t->miss = 0;
+        t->last_key = key;
+        t->cur_run = 0;
+        t->max_run = 0;
+        t->distinct = 0;
+    }
+    t->count++;
+    if (is_miss) t->miss++;
+    if (t->count > 1 && key == t->last_key) {
+        t->cur_run++;
+    } else {
+        t->cur_run = 1;
+    }
+    if (t->cur_run > t->max_run) t->max_run = t->cur_run;
+    t->last_key = key;
+    int already_seen = 0;
+    for (int i = 0; i < t->distinct && i < GQ_OP_TRACK_SEEN_CAP; i++) {
+        if (t->seen_keys[i] == key) { already_seen = 1; break; }
+    }
+    if (!already_seen && t->distinct < GQ_OP_TRACK_SEEN_CAP) {
+        t->seen_keys[t->distinct] = key;
+        t->distinct++;
+    }
+}
+
+static void gq_queue_full_log(void) {
+    static int queue_full_log = 0;
+    if (queue_full_log < 20) {
+        game_log("[GpuQuadsDiag] cola de quads llena (%d) -- descartando contenido este frame\n",
+                 GPU_QUADS_QUEUE_CAP);
+        queue_full_log++;
+        if (log_file) fflush(log_file);
+    }
+}
 
 // buffers temporales del decode dual (max sprite razonable)
 #define GPU_QUADS_MAX_W 1024
 #define GPU_QUADS_MAX_H 1024
 static uint32_t g_rgba_tmp[GPU_QUADS_MAX_W * GPU_QUADS_MAX_H]; // RGBA premult final
 static uint16_t g_pass1_tmp[GPU_QUADS_MAX_W * GPU_QUADS_MAX_H]; // pasada negra (d0)
+
+// Fase 75 (2026-07-23): batching real -- las Fases 72/73/74 confirmaron con
+// datos de consola que un crash determinista (siempre en la propia
+// `_glTexSubImage2D` de vitaGL, PC=0x0) ocurre en frames con miles de quads
+// legitimos (op=0 y op=65537 con `distinct` alto, `miss` ~0 -- NO es un loop
+// redibujando lo mismo, es contenido real y variado que esta area en
+// particular necesita). `gpu_quads_flush()` hacia un `glDrawArrays` POR CADA
+// quad individual (16384 en el peor caso, uno por uno) -- esa es la causa
+// mas probable de agotar algun recurso interno de vitaGL a esa escala, no la
+// cantidad de texturas (`gq_insert_slot` ya acota esa a 4096 con desalojo en
+// anillo). Fix: agrupar corridas CONSECUTIVAS de quads que comparten la
+// MISMA textura (el patron dominante real, confirmado por `max_run` > 1 en
+// los ops densos) en un solo buffer de vertices y un solo `glDrawArrays` por
+// corrida -- reduce miles de draw calls a, en el peor caso, tantos como
+// corridas distintas haya (siempre <= al numero de quads, tipicamente mucho
+// menor). CRITICO: solo se agrupan quads YA ADYACENTES en la cola -- nunca se
+// reordena entre texturas distintas, as que el z-order real del motor
+// (la razon de ser de toda esta arquitectura, ver gpu_quads.h) se preserva
+// exacto. GL_TRIANGLES (6 vertices/quad) en vez de GL_TRIANGLE_STRIP (4) para
+// poder concatenar N quads en un solo buffer sin triangulos fantasma entre
+// ellos. Los texcoords son el MISMO patron para cualquier quad (una textura
+// entera por quad, sin sub-rects de atlas) -- se precalculan UNA vez para el
+// tamano maximo posible (toda la cola) y se reusan siempre, solo el buffer de
+// posiciones se llena por frame.
+#define GQ_BATCH_MAX GPU_QUADS_QUEUE_CAP
+static float g_batch_verts[GQ_BATCH_MAX * 12]; // 6 vertices * (x,y) por quad
+static float g_batch_tc[GQ_BATCH_MAX * 12];    // mismo patron 0..1 repetido
+static int g_batch_tc_ready = 0;
+
+static void gq_batch_tc_init(void) {
+    if (g_batch_tc_ready) return;
+    // 2 triangulos por quad: (x0,y0)-(x1,y0)-(x0,y1) y (x1,y0)-(x1,y1)-(x0,y1)
+    // -- mismo orden que el GL_TRIANGLE_STRIP anterior, sin el vertice
+    // compartido implicito del strip.
+    static const float pat[12] = { 0,0, 1,0, 0,1,  1,0, 1,1, 0,1 };
+    for (int i = 0; i < GQ_BATCH_MAX; i++) {
+        memcpy(&g_batch_tc[i * 12], pat, sizeof(pat));
+    }
+    g_batch_tc_ready = 1;
+}
 
 static unsigned long gq_hash(const void *data, const void *pal, int op, int p8, int w, int h) {
     unsigned long h_val = (unsigned long) data * 2654435761u;
@@ -134,6 +328,43 @@ static gq_entry *gq_insert_slot(const void *data, const void *pal, int op, int p
     return e;
 }
 
+// Fase 69 (2026-07-23): reporte de usuario -- graficos completamente
+// distorsionados al cambiar de stage despues de guardar. La clave de cache
+// (data,pal,op,p8) + 4 bytes muestreados (gq_hash, Fase 55) identifica
+// contenido DINAMICO que muta en el MISMO puntero (texto, minimapa) pero no
+// protege el caso inverso: un puntero NUEVO (heap del motor, reciclado tras
+// liberar los assets del stage anterior) que cae en la MISMA direccion que
+// un buffer ya cacheado, con los mismos 4 bytes iniciales por coincidencia
+// (plausible entre sprites .pzx/RLE distintos que comparten cabecera) --
+// gq_find lo trataria como cache-hit y serviria la textura VIEJA para
+// contenido nuevo, en cualquier cantidad de sprites a la vez. La cache nunca
+// se invalidaba entre stages (gpu_quads_init solo corre una vez, al boot).
+// Este mecanismo se llama desde Zenonia_OnUIStatusChange (java.c) cuando el
+// motor entra a ui_status=19 ("transicion", ver port_progress.md Fase 30),
+// la senal ya instrumentada que marca el turnover de assets entre stages.
+void gpu_quads_invalidate_cache(void) {
+    int deleted = 0;
+    for (int i = 0; i < GPU_QUADS_CACHE_CAP; i++) {
+        gq_entry *e = &g_cache[i];
+        if (e->used) {
+            if (e->tex) glDeleteTextures(1, &e->tex);
+            memset(e, 0, sizeof(*e));
+            deleted++;
+        }
+    }
+    g_cache_count = 0;
+    g_evict_ring = 0;
+    g_fill_mru_key = -1;
+    g_fill_mru_entry = NULL;
+    game_log("[GpuQuads] cache invalidada en transicion de stage (%d texturas liberadas, total_creadas_desde_boot=%lu)\n",
+             deleted, g_total_textures_created);
+    if (log_file) fflush(log_file);
+}
+
+unsigned long gpu_quads_get_total_textures_created(void) {
+    return g_total_textures_created;
+}
+
 void gpu_quads_init(int screen_w, int screen_h) {
     g_screen_w = screen_w;
     g_screen_h = screen_h;
@@ -148,16 +379,17 @@ void gpu_quads_init(int screen_w, int screen_h) {
 }
 
 int gpu_quads_lookup_and_enqueue(const void *data, const void *pal, int op, int p8, int x, int y, int w, int h) {
-    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) return 0;
+    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) { gq_queue_full_log(); return 0; }
     unsigned long hash_val = gq_hash(data, pal, op, p8, w, h);
     gq_entry *e = gq_find(data, pal, op, p8, w, h, hash_val);
     if (e && e->tex) {
-        gq_quads[gq_quads_count].e = e;
+        gq_quads[gq_quads_count].tex = e->tex;
         gq_quads[gq_quads_count].x = (float) x;
         gq_quads[gq_quads_count].y = (float) y;
         gq_quads[gq_quads_count].w = (float) e->w;
         gq_quads[gq_quads_count].h = (float) e->h;
         gq_quads_count++;
+        gq_track_op(op, 0, (unsigned long) data ^ ((unsigned long) p8 * 2654435761u));
         return 1;
     }
     return 0;
@@ -230,6 +462,7 @@ void gpu_quads_finish_decode(const void *data, const void *pal, int op, int p8,
     GLuint tex = 0;
     glGenTextures(1, &tex);
     if (!tex) return;
+    g_total_textures_created++;
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_rgba_tmp);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -251,12 +484,15 @@ void gpu_quads_finish_decode(const void *data, const void *pal, int op, int p8,
     e->ready = 1;
 
     if (gq_quads_count < GPU_QUADS_QUEUE_CAP) {
-        gq_quads[gq_quads_count].e = e;
+        gq_quads[gq_quads_count].tex = e->tex;
         gq_quads[gq_quads_count].x = (float) screen_x;
         gq_quads[gq_quads_count].y = (float) screen_y;
         gq_quads[gq_quads_count].w = (float) w;
         gq_quads[gq_quads_count].h = (float) h;
         gq_quads_count++;
+        gq_track_op(op, 1, (unsigned long) data ^ ((unsigned long) p8 * 2654435761u));
+    } else {
+        gq_queue_full_log();
     }
 }
 
@@ -272,11 +508,12 @@ void gpu_quads_enqueue_text(const unsigned char *alpha, int aw,
                              int screen_x, int screen_y, int w, int h) {
     if (!alpha || w <= 0 || h <= 0) return;
     if (w > GPU_QUADS_MAX_W || h > GPU_QUADS_MAX_H) return;
-    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) return;
+    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) { gq_queue_full_log(); return; }
 
     int p8_color = ((int) r << 16) | ((int) g << 8) | (int) b;
     unsigned long hash_val = gq_hash(alpha, NULL, GQ_TEXT_OP, p8_color, w, h);
     gq_entry *e = gq_find(alpha, NULL, GQ_TEXT_OP, p8_color, w, h, hash_val);
+    int was_miss = (e == NULL);
 
     if (!e) {
         // Premultiplicado (rgb = color*alpha/255, a = alpha) para reusar el
@@ -297,6 +534,7 @@ void gpu_quads_enqueue_text(const unsigned char *alpha, int aw,
         GLuint tex = 0;
         glGenTextures(1, &tex);
         if (!tex) return;
+        g_total_textures_created++;
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_rgba_tmp);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -318,12 +556,13 @@ void gpu_quads_enqueue_text(const unsigned char *alpha, int aw,
     }
 
     if (e && e->tex) {
-        gq_quads[gq_quads_count].e = e;
+        gq_quads[gq_quads_count].tex = e->tex;
         gq_quads[gq_quads_count].x = (float) screen_x;
         gq_quads[gq_quads_count].y = (float) screen_y;
         gq_quads[gq_quads_count].w = (float) w;
         gq_quads[gq_quads_count].h = (float) h;
         gq_quads_count++;
+        gq_track_op(GQ_TEXT_OP, was_miss, (unsigned long) alpha ^ ((unsigned long) p8_color * 2654435761u));
     }
 }
 
@@ -354,7 +593,7 @@ static int g_watch_count = 0;
 void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, unsigned char a,
                              int screen_x, int screen_y, int w, int h) {
     if (w <= 0 || h <= 0) return;
-    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) return;
+    if (gq_quads_count >= GPU_QUADS_QUEUE_CAP) { gq_queue_full_log(); return; }
 
     // No hay puntero de datos real -- se usa un sentinel fijo no-NULL como
     // "data" (gq_hash/gq_find lo tratan como cualquier otro puntero, nunca se
@@ -370,19 +609,19 @@ void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, u
     // a este volumen) cuando la llamada actual usa la MISMA clave que la
     // inmediatamente anterior. Colaboro con el bajon de FPS reportado en un
     // area con mucho detalle de minimapa.
-    static int last_key = -1;
-    static gq_entry *last_entry = NULL;
     gq_entry *e;
+    int was_miss = 0;
     // Verificar que la entrada siga siendo REALMENTE la nuestra (no una
     // reusada por el anillo de desalojo, gq_insert_slot, para otra clave)
     // antes de confiar en el atajo -- barato (3 comparaciones) comparado con
     // el costo de servir la textura equivocada.
-    if (last_entry && key == last_key && last_entry->used &&
-        last_entry->op == GQ_FILL_OP && last_entry->p8 == key) {
-        e = last_entry;
+    if (g_fill_mru_entry && key == g_fill_mru_key && g_fill_mru_entry->used &&
+        g_fill_mru_entry->op == GQ_FILL_OP && g_fill_mru_entry->p8 == key) {
+        e = g_fill_mru_entry;
     } else {
         unsigned long hash_val = gq_hash(&fill_sentinel, NULL, GQ_FILL_OP, key, 1, 1);
         e = gq_find(&fill_sentinel, NULL, GQ_FILL_OP, key, 1, 1, hash_val);
+        was_miss = (e == NULL);
 
         if (!e) {
             uint32_t pr = (uint32_t) r * a / 255;
@@ -393,6 +632,7 @@ void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, u
             GLuint tex = 0;
             glGenTextures(1, &tex);
             if (!tex) return;
+            g_total_textures_created++;
             glBindTexture(GL_TEXTURE_2D, tex);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &texel);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -412,8 +652,8 @@ void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, u
             e->used = 1;
             e->ready = 1;
         }
-        last_key = key;
-        last_entry = e;
+        g_fill_mru_key = key;
+        g_fill_mru_entry = e;
     }
 
     if (e && e->tex) {
@@ -438,16 +678,42 @@ void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, u
             g_watch_h[g_watch_count] = h;
             g_watch_count++;
         }
-        gq_quads[gq_quads_count].e = e;
+        gq_quads[gq_quads_count].tex = e->tex;
         gq_quads[gq_quads_count].x = (float) screen_x;
         gq_quads[gq_quads_count].y = (float) screen_y;
         gq_quads[gq_quads_count].w = (float) w;
         gq_quads[gq_quads_count].h = (float) h;
         gq_quads_count++;
+        gq_track_op(GQ_FILL_OP, was_miss, (unsigned long) key ^ ((unsigned long) screen_x * 97u) ^ ((unsigned long) screen_y * 8191u));
     }
 }
 
 int gpu_quads_flush(void) {
+    // Fase 72: si este frame termino "pesado" (candidato a haber tocado el
+    // cap de la cola, ver Fase 70/71), volcar el desglose por (op) ANTES de
+    // resetear -- responde de una la pregunta que la Fase 70/71 no pudo:
+    // que mecanismo especifico genera el volumen. Rate-limited (10 vuelcos
+    // totales, cada uno hasta GQ_OP_TRACK_CAP lineas) para no saturar el log
+    // si el frame pesado se repite todo el tiempo.
+    static int heavy_frame_log = 0;
+    if (gq_quads_count >= GQ_HEAVY_FRAME_THRESHOLD && heavy_frame_log < 10) {
+        game_log("[GpuQuadsDiag] frame pesado: quads=%d (>= %d) total_texturas_creadas_desde_boot=%lu -- desglose por op:\n",
+                 gq_quads_count, GQ_HEAVY_FRAME_THRESHOLD, g_total_textures_created);
+        for (int i = 0; i < g_op_track_n; i++) {
+            gq_op_track_t *t = &g_op_track[i];
+            game_log("[GpuQuadsDiag]   op=%d count=%d miss(decode nuevo)=%d max_run(misma clave seguida)=%d distinct(claves unicas, tope %d)=%d\n",
+                     t->op, t->count, t->miss, t->max_run, GQ_OP_TRACK_SEEN_CAP, t->distinct);
+        }
+        heavy_frame_log++;
+        // Fase 74: flush inmediato -- esta linea es exactamente la que 3 logs
+        // de usuario seguidos perdieron por cortarse a mitad de escritura
+        // ante un crash real (ver comentario junto a `extern FILE *log_file`
+        // arriba). El flush periodico de la Fase 71 (cada 120 frames) no
+        // alcanza si el crash pasa antes de esa marca.
+        if (log_file) fflush(log_file);
+    }
+    g_op_track_n = 0;
+
     // Fase 66/67: reportar diagnostico de orden ANTES de resetear
     // gq_quads_count. "residual" (Fase 66) solo contaba CUANTOS quads mas se
     // encolaron despues -- no decia si alguno realmente se SUPERPONE con el
@@ -528,26 +794,36 @@ int gpu_quads_flush(void) {
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);
 
-    static const float tc[8] = { 0, 0,  1, 0,  0, 1,  1, 1 };
-
-    // Fase 65: evita glBindTexture repetido cuando el quad actual usa la
-    // MISMA textura que el anterior (corridas largas del mismo relleno --
-    // el minimapa encola cientos de bloques consecutivos del mismo color,
-    // Fase 63/64) -- una llamada a la API GL menos por quad en ese caso, sin
-    // cambiar que se dibuja.
+    // Fase 75: batching real -- agrupa corridas CONSECUTIVAS de quads con la
+    // MISMA textura en un solo glDrawArrays (ver comentario largo junto a
+    // g_batch_verts). Reemplaza el "1 glDrawArrays por quad" de antes (hasta
+    // 16384 llamadas reales por frame, confirmado en consola -- Fases 72-74)
+    // por 1 llamada por CORRIDA -- nunca reordena entre texturas distintas,
+    // el z-order del motor se preserva exacto.
+    gq_batch_tc_init();
     GLuint bound_tex = 0;
+    int batch_count = 0;
     for (int i = 0; i < gq_quads_count; i++) {
         gq_quad *q = &gq_quads[i];
-        gq_entry *e = q->e;
-        float x0 = q->x, y0 = q->y, x1 = q->x + q->w, y1 = q->y + q->h;
-        float verts[8] = { x0, y0,  x1, y0,  x0, y1,  x1, y1 };
-        if (e->tex != bound_tex) {
-            glBindTexture(GL_TEXTURE_2D, e->tex);
-            bound_tex = e->tex;
+        if (batch_count > 0 && q->tex != bound_tex) {
+            glBindTexture(GL_TEXTURE_2D, bound_tex);
+            glVertexPointer(2, GL_FLOAT, 0, g_batch_verts);
+            glTexCoordPointer(2, GL_FLOAT, 0, g_batch_tc);
+            glDrawArrays(GL_TRIANGLES, 0, batch_count * 6);
+            batch_count = 0;
         }
-        glVertexPointer(2, GL_FLOAT, 0, verts);
-        glTexCoordPointer(2, GL_FLOAT, 0, tc);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        bound_tex = q->tex;
+        float x0 = q->x, y0 = q->y, x1 = q->x + q->w, y1 = q->y + q->h;
+        float *v = &g_batch_verts[batch_count * 12];
+        v[0] = x0; v[1] = y0;  v[2] = x1; v[3] = y0;  v[4] = x0; v[5] = y1;
+        v[6] = x1; v[7] = y0;  v[8] = x1; v[9] = y1;  v[10] = x0; v[11] = y1;
+        batch_count++;
+    }
+    if (batch_count > 0) {
+        glBindTexture(GL_TEXTURE_2D, bound_tex);
+        glVertexPointer(2, GL_FLOAT, 0, g_batch_verts);
+        glTexCoordPointer(2, GL_FLOAT, 0, g_batch_tc);
+        glDrawArrays(GL_TRIANGLES, 0, batch_count * 6);
     }
 
     int drawn = gq_quads_count;
