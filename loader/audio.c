@@ -186,6 +186,64 @@ void audio_stop_bgm(void) {
     sceKernelUnlockMutex(audio_mutex, 1);
 }
 
+typedef struct {
+    const unsigned char *data;
+    size_t size;
+    size_t pos;
+} ogg_mem_stream_t;
+
+static size_t ogg_mem_read(void *ptr, size_t size, size_t nmemb, void *datasource) {
+    ogg_mem_stream_t *ms = (ogg_mem_stream_t *) datasource;
+    if (!ms || !ms->data) return 0;
+    size_t bytes_left = (ms->pos < ms->size) ? (ms->size - ms->pos) : 0;
+    size_t to_read = size * nmemb;
+    if (to_read > bytes_left) to_read = bytes_left;
+    if (to_read > 0) {
+        memcpy(ptr, ms->data + ms->pos, to_read);
+        ms->pos += to_read;
+    }
+    return to_read / size;
+}
+
+static int ogg_mem_seek(void *datasource, ogg_int64_t offset, int whence) {
+    ogg_mem_stream_t *ms = (ogg_mem_stream_t *) datasource;
+    if (!ms) return -1;
+    ogg_int64_t new_pos = ms->pos;
+    if (whence == SEEK_SET) new_pos = offset;
+    else if (whence == SEEK_CUR) new_pos += offset;
+    else if (whence == SEEK_END) new_pos = (ogg_int64_t) ms->size + offset;
+    if (new_pos < 0 || new_pos > (ogg_int64_t) ms->size) return -1;
+    ms->pos = (size_t) new_pos;
+    return 0;
+}
+
+static int ogg_mem_close(void *datasource) {
+    ogg_mem_stream_t *ms = (ogg_mem_stream_t *) datasource;
+    if (ms) free(ms);
+    return 0;
+}
+
+static long ogg_mem_tell(void *datasource) {
+    ogg_mem_stream_t *ms = (ogg_mem_stream_t *) datasource;
+    return ms ? (long) ms->pos : -1;
+}
+
+static ov_callbacks g_ogg_mem_callbacks = {
+    ogg_mem_read,
+    ogg_mem_seek,
+    ogg_mem_close,
+    ogg_mem_tell
+};
+
+typedef struct {
+    unsigned char *data;
+    size_t size;
+    int loaded;
+} ogg_cache_entry_t;
+
+#define OGG_CACHE_MAX 160
+static ogg_cache_entry_t g_ogg_cache[OGG_CACHE_MAX] = {0};
+
 void audio_play(int snd_id, int vol, int is_loop) {
     if (audio_port < 0) return;
 
@@ -196,30 +254,49 @@ void audio_play(int snd_id, int vol, int is_loop) {
         return;
     }
 
-    char path[128];
-    snprintf(path, sizeof(path), SND_DIR "/s%03d.ogg", snd_id);
+    const unsigned char *ogg_data = NULL;
+    size_t ogg_size = 0;
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        static int miss_log = 0;
-        if (miss_log < 20) {
-            game_log("[AUDIO] no encontrado: %s\n", path);
-            miss_log++;
+    if (snd_id >= 0 && snd_id < OGG_CACHE_MAX) {
+        if (!g_ogg_cache[snd_id].loaded) {
+            char path[128];
+            snprintf(path, sizeof(path), SND_DIR "/s%03d.ogg", snd_id);
+            FILE *f = fopen(path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz > 0 && sz < 4 * 1024 * 1024) {
+                    g_ogg_cache[snd_id].data = (unsigned char *) malloc((size_t) sz);
+                    if (g_ogg_cache[snd_id].data) {
+                        fread(g_ogg_cache[snd_id].data, 1, (size_t) sz, f);
+                        g_ogg_cache[snd_id].size = (size_t) sz;
+                    }
+                }
+                fclose(f);
+            }
+            g_ogg_cache[snd_id].loaded = 1;
         }
-        return;
+        ogg_data = g_ogg_cache[snd_id].data;
+        ogg_size = g_ogg_cache[snd_id].size;
     }
 
+    if (!ogg_data || ogg_size == 0) return;
+
+    ogg_mem_stream_t *ms = (ogg_mem_stream_t *) malloc(sizeof(ogg_mem_stream_t));
+    if (!ms) return;
+    ms->data = ogg_data;
+    ms->size = ogg_size;
+    ms->pos = 0;
+
     OggVorbis_File vf;
-    if (ov_open(f, &vf, NULL, 0) < 0) {
-        game_log("[AUDIO] ov_open fallo para %s\n", path);
-        fclose(f);
+    if (ov_open_callbacks(ms, &vf, NULL, 0, g_ogg_mem_callbacks) < 0) {
+        free(ms);
         return;
     }
     vorbis_info *vi = ov_info(&vf, -1);
     if (!vi || (vi->channels != 1 && vi->channels != 2)) {
-        game_log("[AUDIO] formato inesperado en %s (ch=%d rate=%ld)\n",
-                 path, vi ? vi->channels : -1, vi ? vi->rate : -1);
-        ov_clear(&vf); // tambien cierra el FILE*
+        ov_clear(&vf); // tambien libera `ms`
         return;
     }
 

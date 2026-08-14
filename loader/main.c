@@ -28,6 +28,7 @@
 #include "so_util.h"
 #include "audio.h"
 #include "androidui.h"
+#include "preloader.h"
 
 // Override vitaGL splash screen (strong symbol overrides the one in libvitaGL.a)
 void invoke_splashscreen(void) {}
@@ -41,6 +42,22 @@ void invoke_splashscreen(void) {}
 
 #define printf psvDebugScreenPrintf
 #define LOG_DIR "ux0:data/zenonia-4/logs"
+
+#ifdef ZENONIA_FRAMESKIP
+enum {
+    FRAMESKIP_OFF  = 0, // 1.0x (Sin salto)
+    FRAMESKIP_1_5X = 1, // 1.5x (Salta 1 de cada 3 frames)
+    FRAMESKIP_2_0X = 2, // 2.0x (Salta 1 de cada 2 frames)
+    FRAMESKIP_2_5X = 3, // 2.5x (Salta 3 de cada 5 frames)
+    FRAMESKIP_3_0X = 4, // 3.0x (Salta 2 de cada 3 frames)
+    FRAMESKIP_COUNT = 5
+};
+volatile int g_frameskip_mode = FRAMESKIP_2_0X; // Default: 2.0x
+volatile int g_frameskip_is_skip_frame = 0;
+#else
+volatile int g_frameskip_mode = 0;
+volatile int g_frameskip_is_skip_frame = 0;
+#endif
 
 // GAME_W/H/SCREEN_W/H = resolucion que el motor CREE que tiene (pasada a
 // NativeInitDeviceInfo/NativeInitWithBufferSize/NativeResize) -- fijas en
@@ -111,6 +128,7 @@ unsigned int sceLibcHeapSize = 4 * 1024 * 1024; // 4 MB para SCE Libc (system li
 // Un archivo de log por corrida, con timestamp, dentro de logs/ -- mantiene
 // el historial completo entre pruebas en vez de pisar siempre el mismo
 // log.txt (ver psvita-porting skill, hardware_debugging.md).
+#ifdef ZENONIA_ENABLE_LOGGING
 void init_log() {
     sceIoMkdir(LOG_DIR, 0777); // falla en silencio si ya existe
 
@@ -126,29 +144,20 @@ void init_log() {
 }
 
 void game_log(const char *fmt, ...) {
+    if (!log_file) return;
     va_list list;
-    // Fase 94 (port_progress.md): la linea periodica de "frame N alive" crecio
-    // organicamente durante muchas fases (Fase 27/29/31/36/41/48/77/86/92,
-    // cada una agregando un campo mas) hasta superar los 512 bytes SIN que
-    // nadie lo notara -- vsnprintf trunca en silencio (no hay overflow, pero
-    // tampoco error visible), asi que TODO lo que quedaba despues del corte
-    // (avg_sprite_cache_hits/misses de la Fase 92, y ya desde la Fase 86,
-    // total_texturas_creadas/touch.reportNum/pad.buttons/ui_status) nunca
-    // llego a ningun log real -- confirmado contando bytes contra un log real
-    // del usuario (534/608 caracteres segun la fase, contra el limite de 512).
-    // 2048 da margen real para que la linea siga creciendo varias fases mas
-    // sin repetir este bug.
     char string[2048];
 
     va_start(list, fmt);
     vsnprintf(string, sizeof(string), fmt, list);
     va_end(list);
 
-    if (log_file) {
-        fprintf(log_file, "%s", string);
-        // fflush(log_file); // ELIMINADO: esto causa un cuello de botella de I/O brutal (10 FPS)
-    }
+    fprintf(log_file, "%s", string);
 }
+#else
+void init_log() {}
+void game_log(const char *fmt, ...) { (void)fmt; }
+#endif
 
 void fatal_error(const char *fmt, ...) {
     va_list list;
@@ -511,6 +520,9 @@ int main() {
 		game_log("vitaGL inicializado.\n");
 		audio_init();
 		splash_load();
+#ifdef ZENONIA_ENABLE_PRELOAD
+		zenonia_preloader_run();
+#endif
 		// androidui_load() intentaba cargar ~16 .rgba + 2 .html especificos
 		// de Zenonia 3 (nombres confirmados en DOS logs reales que nunca
 		// existen para Zenonia 4 -- el logo/titulo/menu de este juego se
@@ -634,6 +646,10 @@ int main() {
 		SceUInt64 frame_phase_cletevent_accum_us = 0;
 		SceUInt64 frame_phase_nativerender_accum_us = 0;
 		SceUInt64 frame_phase_rest_accum_us = 0;
+#endif
+
+#ifdef ZENONIA_FRAMESKIP
+		osd_show_message("FRAME SKIP: 2.0X (R+SELECT)", 150);
 #endif
 
 		while (1) {
@@ -806,6 +822,21 @@ int main() {
 				if (released & btn_map[i].btn)
 					queue_input_event(MH_KEY_RELEASEEVENT, btn_map[i].hal, 0, 0);
 			}
+
+#ifdef ZENONIA_FRAMESKIP
+			if (((pressed & SCE_CTRL_SELECT) && (pad.buttons & SCE_CTRL_RTRIGGER)) ||
+			    ((pressed & SCE_CTRL_RTRIGGER) && (pad.buttons & SCE_CTRL_SELECT))) {
+				g_frameskip_mode = (g_frameskip_mode + 1) % FRAMESKIP_COUNT;
+				const char *mode_str = "FRAME SKIP: 1X (OFF)";
+				if (g_frameskip_mode == FRAMESKIP_1_5X) mode_str = "FRAME SKIP: 1.5X";
+				else if (g_frameskip_mode == FRAMESKIP_2_0X) mode_str = "FRAME SKIP: 2.0X";
+				else if (g_frameskip_mode == FRAMESKIP_2_5X) mode_str = "FRAME SKIP: 2.5X";
+				else if (g_frameskip_mode == FRAMESKIP_3_0X) mode_str = "FRAME SKIP: 3.0X (MAX)";
+				
+				osd_show_message(mode_str, 90);
+				game_log("[FrameSkip] Modo cambiado a: %s (mode=%d)\n", mode_str, g_frameskip_mode);
+			}
+#endif
 			old_buttons = pad.buttons;
 
 			// Touch: panel 1920x1088 -> espacio de JUEGO (GAME_W x GAME_H =
@@ -933,8 +964,36 @@ int main() {
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			SceUInt64 fp_frame_start = sceKernelGetProcessTimeWide();
 #endif
-			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-			glClear(GL_COLOR_BUFFER_BIT);
+
+#ifdef ZENONIA_FRAMESKIP
+			static int s_frameskip_counter = 0;
+			// Frame Skip multi-nivel en todo el juego (Title, Menu, Gameplay)
+			switch (g_frameskip_mode) {
+				case FRAMESKIP_1_5X: // Salta 1 de cada 3 frames
+					g_frameskip_is_skip_frame = ((s_frameskip_counter % 3) == 0);
+					break;
+				case FRAMESKIP_2_0X: // Salta 1 de cada 2 frames
+					g_frameskip_is_skip_frame = ((s_frameskip_counter % 2) == 1);
+					break;
+				case FRAMESKIP_2_5X: { // Salta 3 de cada 5 frames
+					int mod5 = s_frameskip_counter % 5;
+					g_frameskip_is_skip_frame = (mod5 == 1 || mod5 == 3 || mod5 == 4);
+					break;
+				}
+				case FRAMESKIP_3_0X: // Salta 2 de cada 3 frames
+					g_frameskip_is_skip_frame = ((s_frameskip_counter % 3) != 0);
+					break;
+				default: // FRAMESKIP_OFF
+					g_frameskip_is_skip_frame = 0;
+					break;
+			}
+			s_frameskip_counter++;
+#endif
+
+			if (!g_frameskip_is_skip_frame) {
+				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+				glClear(GL_COLOR_BUFFER_BIT);
+			}
 
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			SceUInt64 fp_before_clet = sceKernelGetProcessTimeWide();
@@ -995,25 +1054,24 @@ int main() {
 			gpu_quads_decoded_accum += g_gpu_quads_decoded_this_frame;
 			g_gpu_quads_decoded_this_frame = 0;
 
-			// Mientras el motor este en logo/titulo (estados de UI de Java,
-			// invisibles en el loader nativo -- pendiente confirmar los
-			// numeros de estado reales de Zenonia 3 en Fase 5), tapar con
-			// el splash.
-			if (g_ui_status >= 0 && g_ui_status <= 1) splash_draw();
+			// En frames normales (no saltados), componer UI y presentar a pantalla
+			if (!g_frameskip_is_skip_frame) {
+				// Mientras el motor este en logo/titulo (estados de UI de Java,
+				// invisibles en el loader nativo -- pendiente confirmar los
+				// numeros de estado reales de Zenonia 3 en Fase 5), tapar con
+				// el splash.
+				if (g_ui_status >= 0 && g_ui_status <= 1) splash_draw();
 
-			// Logo/titulo/menu (ui_status -1/1/2): el .so nativo solo dibuja
-			// un fondo generico (CMvTitleState::DrawZeroGrade/DrawTeamLogo) --
-			// el arte real (logo, fondo de titulo, fondo+botones de menu) lo
-			// dibujaba Android como ImageView/ImageButton superpuestos al
-			// GLSurfaceView (ver androidui.c). Sin capa Java, hay que
-			// replicarlo aca.
-			androidui_draw(g_ui_status, SCREEN_W, SCREEN_H);
-
-			vglSwapBuffers(GL_FALSE);
-#ifndef ZENONIA_DISABLE_VSYNC
-            // Forzar limite a 30 FPS (esperar un vblank extra, ya que vglSwapBuffers espera el primero)
-            sceDisplayWaitVblankStart();
-#endif
+				// Logo/titulo/menu (ui_status -1/1/2): el .so nativo solo dibuja
+				// un fondo generico (CMvTitleState::DrawZeroGrade/DrawTeamLogo) --
+				// el arte real (logo, fondo de titulo, fondo+botones de menu) lo
+				// dibujaba Android como ImageView/ImageButton superpuestos al
+				// GLSurfaceView (ver androidui.c). Sin capa Java, hay que
+				// replicarlo aca.
+				androidui_draw(g_ui_status, SCREEN_W, SCREEN_H);
+				osd_draw();
+				vglSwapBuffers(GL_FALSE);
+			}
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			// "rest" = todo lo que NO es handleCletEvent ni NativeRender:
 			// sceCtrlPeekBufferPositive/sceTouchPeek del tope del loop, el

@@ -56,6 +56,26 @@ if (RGB565_DIRECT_UPLOAD)
   add_definitions(-DZENONIA_RGB565_DIRECT=1)
 endif()
 
+## Frame Skip: salta el renderizado de sprites y subida de 1MB a vitaGL en frames
+## impares durante el gameplay (ui_status == 14), acelerando la velocidad de juego
+## al doble en CPU pura, con 60 Hz de actualizacion de logica/inputs.
+option(ENABLE_FRAMESKIP "Enable intelligent frame skip on gameplay frames for smooth 20+ FPS on CPU" ON)
+if (ENABLE_FRAMESKIP)
+  add_definitions(-DZENONIA_FRAMESKIP=1)
+endif()
+
+## Precarga de Assets al inicio con pantalla de progreso (Fase 114)
+option(ENABLE_ASSET_PRELOAD "Preload all assets into RAM at startup with progress screen" OFF)
+if (ENABLE_ASSET_PRELOAD)
+  add_definitions(-DZENONIA_ENABLE_PRELOAD=1)
+endif()
+
+## Logging a disco en ux0:data/zenonia-4/logs/
+option(ENABLE_LOGGING "Enable writing debug logs to ux0:data/zenonia-4/logs" ON)
+if (ENABLE_LOGGING)
+  add_definitions(-DZENONIA_ENABLE_LOGGING=1)
+endif()
+
 ## Fase 29 (port_progress.md): hook de SOLO CONTEO sobre DrawNative (el
 ## blitter real detras de CMvCharacter::DrawCharacter -> CGxPZxAni::Draw ->
 ## CGcxBitmap::Blt/PutNativeImage -- ver dynlib.c) para confirmar en consola
@@ -383,6 +403,7 @@ add_executable(${PROJECT_NAME}
   ./loader/main.c
   ./loader/dynlib.c loader/sprite_decode.c
   ./loader/gpu_quads.c
+  ./loader/preloader.c
   ./loader/so_util.c
   ./loader/java.c
   ./loader/audio.c

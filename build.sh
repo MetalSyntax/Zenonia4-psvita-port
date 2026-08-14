@@ -153,8 +153,22 @@ set -e
 # extendido a NEON_LIBC_INTERCEPT/DISABLE_VSYNC/DIRTY_RECT_UPLOAD/
 # INSTRUMENT_CGSGRAPHICS_CALLS al agregarlos.
 VPK_OUTPUT_NAME="zenonia_4"
-CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=ON -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF)
-if [ "$1" = "--neon-fallback" ]; then
+CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DENABLE_FRAMESKIP=ON -DENABLE_ASSET_PRELOAD=OFF)
+if [ "$1" = "--turbo-nologs" ]; then
+    # Variante Turbo SIN LOGS: Maxima velocidad pura en CPU (cero I/O a SD, cero format strings).
+    VPK_OUTPUT_NAME="zenonia_4_turbo_nologs"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DENABLE_FRAMESKIP=ON -DENABLE_ASSET_PRELOAD=OFF -DENABLE_LOGGING=OFF)
+elif [ "$1" = "--turbo-opt" ]; then
+    # Variante Turbo: FrameSkip multi-nivel (1.0x-3.0x), bypass de FastClear redundante, NEON memcpy/memset y subida directa RGB565.
+    VPK_OUTPUT_NAME="zenonia_4_turbo"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DENABLE_FRAMESKIP=ON -DENABLE_ASSET_PRELOAD=OFF -DENABLE_LOGGING=ON)
+elif [ "$1" = "--cpu-max-opt" ] || [ "$1" = "--frameskip-test" ]; then
+    VPK_OUTPUT_NAME="zenonia_4_frameskip"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DENABLE_FRAMESKIP=ON -DENABLE_ASSET_PRELOAD=OFF)
+elif [ "$1" = "--preload" ]; then
+    VPK_OUTPUT_NAME="zenonia_4_preload"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=ON -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=ON -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DENABLE_FRAMESKIP=ON -DENABLE_ASSET_PRELOAD=ON)
+elif [ "$1" = "--neon-fallback" ]; then
     VPK_OUTPUT_NAME="zenonia_4_neonfallback"
     CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF)
 elif [ "$1" = "--drawnative-probe" ]; then
@@ -239,6 +253,11 @@ elif [ "$1" = "--skip-blit-test" ]; then
     # Variante 1: techo de FPS (PutCompressImg no-op). Ver CMakeLists SKIP_SPRITE_BLIT.
     VPK_OUTPUT_NAME="zenonia_4_skip_blit_test"
     CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DSKIP_SPRITE_BLIT=ON)
+elif [ "$1" = "--gpu-atlas-test" ]; then
+    # Texture Atlas GPU Quads: Zero-allocation, mega-texturas fijas 1024x1024, batching masivo.
+    # Subida directa RGB565 (sin overhead NEON en CPU) con re-bindeo seguro de g_engine_bound_tex.
+    VPK_OUTPUT_NAME="zenonia_4_gpu_atlas"
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DGPU_QUADS=ON -DNEON_LIBC_INTERCEPT=ON -DFASTCLEAR_NEON_OPTIMIZE=ON -DSPRITE_DECODE_OPTIMIZE=ON)
 elif [ "$1" = "--gpu-quads-test" ]; then
     # Variante 2: sprites COPY -> quads GPU. Ver CMakeLists GPU_QUADS / loader/gpu_quads.c.
     VPK_OUTPUT_NAME="zenonia_4_gpu_quads_test"
@@ -261,9 +280,26 @@ elif [ "$1" = "--gpu-quads-cpuconv-test" ]; then
     VPK_OUTPUT_NAME="zenonia_4_gpu_quads_cpuconv_test"
     CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DGPU_QUADS=ON)
 elif [ "$1" = "--gpu-quads-pure-test" ]; then
-    # Build puro de GPU QUADS, sin ninguna optimizacion de rendimiento, sin NEON, sin VSync.
+    # Build puro de GPU QUADS, sin ninguna optimizacion de rendimiento, sin NEON.
+    # Fase 95 (2026-07-25): este build ORIGINALMENTE tambien traia
+    # DISABLE_VSYNC=ON -- la MISMA combinacion (DISABLE_VSYNC+GPU_QUADS) que la
+    # Fase 81 confirmo que puede colgar la consola ENTERA (no solo la app, sin
+    # `.psp2dmp`, requiere reiniciar hardware) por desborde de la cola de
+    # comandos de la GPU real. El comentario de --gpu-quads-novsync-test (mas
+    # abajo) YA advertia esto explicitamente por nombre ("NO USAR ... ni
+    # --gpu-quads-pure-test") pero el flag seguia construyendo la combinacion
+    # peligrosa igual -- una advertencia en un comentario no impide que otra
+    # sesion futura (o el usuario probando builds ya compilados en build/) lo
+    # siga usando sin verla. Una sesion de prueba real con este build NO
+    # colgo la consola (solo corrupcion visual -- ver Fase 95), pero el
+    # comentario de la Fase 81 ya preveia exactamente esto: "no crasheo" no es
+    # evidencia de nada arreglado, solo que ESA corrida en particular no llego
+    # a desbordar la cola. Corregido: DISABLE_VSYNC=OFF, este build ya NO
+    # combina con GPU_QUADS -- si hace falta reproducir el cuelgue a
+    # proposito, usar --gpu-quads-novsync-test (que ahora requiere la
+    # confirmacion explicita de mas abajo).
     VPK_OUTPUT_NAME="zenonia_4_gpu_quads_pure_test"
-    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=ON -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DGPU_QUADS=ON -DSKIP_SPRITE_BLIT=OFF -DDOWNSAMPLE_RENDER=OFF)
+    CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=OFF -DINSTRUMENT_DRAWNATIVE_CALLS=OFF -DINSTRUMENT_HOTPATH_CALLS=OFF -DNEON_LIBC_INTERCEPT=OFF -DDISABLE_VSYNC=OFF -DDIRTY_RECT_UPLOAD=OFF -DINSTRUMENT_CGSGRAPHICS_CALLS=OFF -DSPRITE_DECODE_OPTIMIZE=OFF -DSPRITE_DECODE_EX_ALPHA=OFF -DSPRITE_DECODE_CACHE=OFF -DFASTCLEAR_NEON_OPTIMIZE=OFF -DINTERLACED_UPLOAD=OFF -DINSTRUMENT_FRAME_PHASES=OFF -DINSTRUMENT_TEXT_CALLS=OFF -DTEXT_NATIVE_OPTIMIZE=OFF -DGPU_QUADS=ON -DSKIP_SPRITE_BLIT=OFF -DDOWNSAMPLE_RENDER=OFF)
 elif [ "$1" = "--gpu-quads-novsync-test" ]; then
     # Fase 80/81 (port_progress.md, 2026-07-24): PELIGRO CONFIRMADO EN
     # CONSOLA REAL -- este build (DISABLE_VSYNC=ON + GPU_QUADS=ON) COLGO LA
@@ -300,6 +336,36 @@ elif [ "$1" = "--primitives-opt-test" ]; then
     # y reversear ese path -- ver optimization_ideas.md.
     VPK_OUTPUT_NAME="zenonia_4_primitives_opt_test"
     CMAKE_EXTRA_ARGS=(-DVPK_OUTPUT_NAME="$VPK_OUTPUT_NAME" -DRGB565_DIRECT_UPLOAD=ON -DFASTCLEAR_NEON_OPTIMIZE=ON -DNEON_LIBC_INTERCEPT=ON)
+fi
+
+# Fase 95 (2026-07-25): guardia dura contra DISABLE_VSYNC=ON + GPU_QUADS=ON --
+# la Fase 81 confirmo en consola real que esta combinacion puede colgar la
+# consola ENTERA (sin `.psp2dmp`, requiere reiniciar hardware), y un comentario
+# de texto en --gpu-quads-pure-test NO impidio que se siguiera construyendo/
+# usando esa combinacion (ver el fix de ese flag mas arriba). En vez de confiar
+# en que quien corre el script haya leido los comentarios, se verifica el
+# array real de flags: si alguna variante (incluido --gpu-quads-novsync-test,
+# que existe A PROPOSITO para reproducir el cuelgue) trae ambos, hace falta
+# poner explicitamente I_ACCEPT_CONSOLE_HANG_RISK=1 en el entorno para
+# continuar -- sin eso, el script se detiene ANTES de compilar nada.
+HAS_DISABLE_VSYNC_ON=0
+HAS_GPU_QUADS_ON=0
+for arg in "${CMAKE_EXTRA_ARGS[@]}"; do
+    [ "$arg" = "-DDISABLE_VSYNC=ON" ] && HAS_DISABLE_VSYNC_ON=1
+    [ "$arg" = "-DGPU_QUADS=ON" ] && HAS_GPU_QUADS_ON=1
+done
+if [ "$HAS_DISABLE_VSYNC_ON" = "1" ] && [ "$HAS_GPU_QUADS_ON" = "1" ] && [ "$I_ACCEPT_CONSOLE_HANG_RISK" != "1" ]; then
+    echo "================================================================"
+    echo "  PELIGRO: esta variante combina DISABLE_VSYNC=ON + GPU_QUADS=ON."
+    echo "  La Fase 81 (port_progress.md) confirmo que esta combinacion puede"
+    echo "  colgar la consola ENTERA en hardware real (no un crash de app --"
+    echo "  sin .psp2dmp, requiere reiniciar el equipo)."
+    echo ""
+    echo "  Si de verdad queres reproducir ese cuelgue a proposito (unico uso"
+    echo "  valido de esta combinacion), corre de nuevo con:"
+    echo "    I_ACCEPT_CONSOLE_HANG_RISK=1 ./build.sh $1"
+    echo "================================================================"
+    exit 1
 fi
 
 # Configuracion

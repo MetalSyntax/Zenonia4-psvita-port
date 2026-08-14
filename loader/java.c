@@ -33,14 +33,217 @@
 
 extern void game_log(const char *fmt, ...);
 
-// readAssets/isAssetExist se llaman siempre con el mismo path relativo (el
-// motor llama isAssetExist(path) antes de decidir si vale la pena llamar
-// readAssets(path)), asi que ambos deben resolver igual. Igual que en
-// Zenonia 2: probar primero el path pelado (ux0:data/zenonia-4/<name>) y si
-// no existe, el prefijado con assets/ (que usan los hooks de dynlib.c para
-// todo lo demas) -- sin asumir cual es la convencion real hasta confirmarla
-// con un log de consola.
+#include <dirent.h>
+
+// --- Cache de assets en memoria (VFS RAM Cache) con Hash Table O(1) ---
+#define ZENONIA_ASSET_CACHE_MAX 4096
+#define ZENONIA_ASSET_HASH_SIZE 8192
+
+typedef struct zenonia_asset_node {
+    char path[256];
+    unsigned char *data;
+    long size;
+    struct zenonia_asset_node *next;
+} zenonia_asset_node_t;
+
+static zenonia_asset_node_t g_asset_nodes[ZENONIA_ASSET_CACHE_MAX];
+static zenonia_asset_node_t *g_asset_hash_table[ZENONIA_ASSET_HASH_SIZE] = {0};
+static int g_asset_cache_count = 0;
+
+static inline unsigned int zenonia_asset_str_hash(const char *str) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = (unsigned char)*str++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash % ZENONIA_ASSET_HASH_SIZE;
+}
+
+static void zenonia_asset_hash_insert(const char *key, zenonia_asset_node_t *node) {
+    if (!key || !key[0]) return;
+    unsigned int h = zenonia_asset_str_hash(key);
+    zenonia_asset_node_t *cur = g_asset_hash_table[h];
+    while (cur) {
+        if (strcmp(cur->path, key) == 0) return;
+        cur = cur->next;
+    }
+    if (strcmp(node->path, key) != 0) {
+        zenonia_asset_node_t *alias = (zenonia_asset_node_t *) malloc(sizeof(zenonia_asset_node_t));
+        if (alias) {
+            snprintf(alias->path, sizeof(alias->path), "%s", key);
+            alias->data = node->data;
+            alias->size = node->size;
+            alias->next = g_asset_hash_table[h];
+            g_asset_hash_table[h] = alias;
+        }
+    } else {
+        node->next = g_asset_hash_table[h];
+        g_asset_hash_table[h] = node;
+    }
+}
+
+zenonia_asset_node_t *zenonia_asset_cache_find(const char *path) {
+    if (!path || !path[0] || g_asset_cache_count == 0) return NULL;
+    
+    // 1. Direct hash lookup
+    unsigned int h = zenonia_asset_str_hash(path);
+    zenonia_asset_node_t *cur = g_asset_hash_table[h];
+    while (cur) {
+        if (strcmp(cur->path, path) == 0) return cur;
+        cur = cur->next;
+    }
+
+    // 2. Si empieza con "ux0:data/zenonia-4/assets/", probar sin prefijo
+    const char *prefix_assets = "ux0:data/zenonia-4/assets/";
+    size_t prefix_assets_len = 26;
+    if (strncmp(path, prefix_assets, prefix_assets_len) == 0) {
+        const char *rel = path + prefix_assets_len;
+        h = zenonia_asset_str_hash(rel);
+        cur = g_asset_hash_table[h];
+        while (cur) {
+            if (strcmp(cur->path, rel) == 0) return cur;
+            cur = cur->next;
+        }
+    }
+
+    // 3. Si empieza con "ux0:data/zenonia-4/", probar con "assets/" o sin prefijo
+    const char *prefix_root = "ux0:data/zenonia-4/";
+    size_t prefix_root_len = 19;
+    if (strncmp(path, prefix_root, prefix_root_len) == 0) {
+        const char *rel = path + prefix_root_len;
+        h = zenonia_asset_str_hash(rel);
+        cur = g_asset_hash_table[h];
+        while (cur) {
+            if (strcmp(cur->path, rel) == 0) return cur;
+            cur = cur->next;
+        }
+        char with_assets[256];
+        snprintf(with_assets, sizeof(with_assets), "ux0:data/zenonia-4/assets/%s", rel);
+        h = zenonia_asset_str_hash(with_assets);
+        cur = g_asset_hash_table[h];
+        while (cur) {
+            if (strcmp(cur->path, with_assets) == 0) return cur;
+            cur = cur->next;
+        }
+    } else {
+        // Si no tiene prefijo, probar anteponiendo "ux0:data/zenonia-4/assets/"
+        char full_a[256];
+        snprintf(full_a, sizeof(full_a), "ux0:data/zenonia-4/assets/%s", path);
+        h = zenonia_asset_str_hash(full_a);
+        cur = g_asset_hash_table[h];
+        while (cur) {
+            if (strcmp(cur->path, full_a) == 0) return cur;
+            cur = cur->next;
+        }
+    }
+
+    return NULL;
+}
+
+int zenonia_asset_cache_exists(const char *path) {
+    return (zenonia_asset_cache_find(path) != NULL);
+}
+
+static void zenonia_asset_cache_store(const char *path, unsigned char *data, long size, int take_ownership) {
+    if (g_asset_cache_count >= ZENONIA_ASSET_CACHE_MAX) {
+        if (take_ownership) free(data);
+        return;
+    }
+    zenonia_asset_node_t *node = &g_asset_nodes[g_asset_cache_count++];
+    snprintf(node->path, sizeof(node->path), "%s", path);
+    if (take_ownership) {
+        node->data = data;
+    } else {
+        node->data = (unsigned char *) malloc(size > 0 ? (size_t) size : 1);
+        if (node->data && size > 0 && data) memcpy(node->data, data, size);
+    }
+    node->size = size;
+    node->next = NULL;
+
+    zenonia_asset_hash_insert(path, node);
+
+    const char *prefix_assets = "ux0:data/zenonia-4/assets/";
+    if (strncmp(path, prefix_assets, 26) == 0) {
+        const char *rel = path + 26;
+        char root_path[256];
+        snprintf(root_path, sizeof(root_path), "ux0:data/zenonia-4/%s", rel);
+        zenonia_asset_hash_insert(rel, node);
+        zenonia_asset_hash_insert(root_path, node);
+    }
+}
+
+int zenonia_asset_cache_preload_file(const char *path) {
+    if (zenonia_asset_cache_find(path)) return 1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    struct stat st;
+    long size = -1;
+    if (fstat(fileno(f), &st) == 0) {
+        size = st.st_size;
+    }
+    if (size <= 0 || size > 64 * 1024 * 1024) {
+        fclose(f);
+        return 0;
+    }
+    unsigned char *buf = (unsigned char *) malloc((size_t) size);
+    if (!buf) {
+        fclose(f);
+        return 0;
+    }
+    fread(buf, 1, size, f);
+    fclose(f);
+    zenonia_asset_cache_store(path, buf, size, 1);
+    return 1;
+}
+
+static void zenonia_asset_cache_preload_dir(const char *dir_path, int *cur_count, void (*progress_cb)(int cur, const char *name)) {
+    DIR *d = opendir(dir_path);
+    if (!d) return;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (entry->d_name[0] == '.') continue;
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+        struct stat st;
+        if (stat(full_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                zenonia_asset_cache_preload_dir(full_path, cur_count, progress_cb);
+            } else if (S_ISREG(st.st_mode)) {
+                if (zenonia_asset_cache_preload_file(full_path)) {
+                    (*cur_count)++;
+                    if (progress_cb) progress_cb(*cur_count, entry->d_name);
+                }
+            }
+        }
+    }
+    closedir(d);
+}
+
+int zenonia_asset_cache_preload_all(void (*progress_cb)(int cur, const char *name)) {
+    int count = 0;
+    game_log("[Preload] Starting VFS asset preloading from ux0:data/zenonia-4/assets...\n");
+    zenonia_asset_cache_preload_dir("ux0:data/zenonia-4/assets", &count, progress_cb);
+    game_log("[Preload] Preload complete: %d asset files in RAM cache\n", count);
+    return count;
+}
+
 static int zenonia_resolve_asset_path(const char *name, char *out, size_t out_size) {
+    if (!name || !name[0]) return 0;
+
+    // 1. FAST PATH: Check RAM cache first (0 syscalls, 0 disk I/O)
+    snprintf(out, out_size, "ux0:data/zenonia-4/assets/%s", name);
+    if (zenonia_asset_cache_find(out)) return 1;
+
+    snprintf(out, out_size, "ux0:data/zenonia-4/%s", name);
+    if (zenonia_asset_cache_find(out)) return 1;
+
+    if (zenonia_asset_cache_find(name)) {
+        snprintf(out, out_size, "ux0:data/zenonia-4/assets/%s", name);
+        return 1;
+    }
+
+    // 2. FALLBACK PATH: Physical disk check (for non-preloaded files, e.g. saves)
     snprintf(out, out_size, "ux0:data/zenonia-4/%s", name);
     if (access(out, F_OK) == 0) return 1;
 
@@ -50,46 +253,44 @@ static int zenonia_resolve_asset_path(const char *name, char *out, size_t out_si
     return 0;
 }
 
-// --- Puente para que readAssets sirva a los DOS consumidores distintos que
-// tiene el motor ---
-//
-// El truco de "ArrayObject de Dalvik" (header de 16 bytes + datos crudos,
-// ver Zenonia_readAssets) funciona para el consumidor directo por puntero
-// (MC_knlGetResource y el resto de CMvResourceMgr) porque ese codigo nunca
-// pasa por las funciones estandar de arrays de JNI -- lee offset+16
-// directamente. Pero un consumidor DISTINTO (confirmado real: la familia de
-// parsers "PZx"/"PZD" -- CGxPZDParser/CGxZeroPZDParser -- usada para
-// TouchOemIME.pzx y otros .pzx, ver port_progress.md Fase 3.7) SI llama a
-// GetArrayLength/GetByteArrayElements estandar sobre el mismo resultado de
-// readAssets. Como nuestro bloque no es un JavaDynArray real (no paso por
-// jda_alloc), FalsoJNI no lo encuentra ("Could not find the array") y esos
-// parsers reciben NULL/longitud 0 -- causando un crash rio abajo (puntero
-// NULL asumido valido tras un "exito" a medias del parser).
-//
-// Solucion: interceptar GetArrayLength/GetByteArrayElements/
-// GetByteArrayRegion/ReleaseByteArrayElements de la tabla de funciones JNI
-// (mutable en memoria pese al `const` del tipo publico -- jni_init() la
-// aloca con malloc()) para reconocer nuestros propios bloques (llevando un
-// registro de punteros devueltos por Zenonia_readAssets) y servirlos
-// directamente desde el header Dalvik, cayendo al codigo real de FalsoJNI
-// para cualquier otro array (los JavaDynArray genuinos de jda_alloc, usados
-// por ejemplo en las funciones GFA_* de la Fase 3.5).
-#define ZENONIA_DALVIK_REGISTRY_MAX 1024
-static void *g_dalvik_registry[ZENONIA_DALVIK_REGISTRY_MAX];
-static int g_dalvik_registry_count = 0;
+// Registro hash O(1) de punteros devueltos por readAssets (evita Data Abort con punteros dummy como 0x42424242 de FalsoJNI)
+#define ZENONIA_DALVIK_REGISTRY_MAX 4096
+#define ZENONIA_DALVIK_HASH_MASK 0xFFF // 4096 buckets
+
+typedef struct dalvik_node {
+    void *ptr;
+    struct dalvik_node *next;
+} dalvik_node_t;
+
+static dalvik_node_t g_dalvik_nodes[ZENONIA_DALVIK_REGISTRY_MAX];
+static dalvik_node_t *g_dalvik_hash[ZENONIA_DALVIK_REGISTRY_MAX] = {0};
+static int g_dalvik_count = 0;
 
 static void zenonia_register_dalvik_array(void *ptr) {
-    if (g_dalvik_registry_count < ZENONIA_DALVIK_REGISTRY_MAX) {
-        g_dalvik_registry[g_dalvik_registry_count++] = ptr;
-    } else {
-        game_log("[Java] ADVERTENCIA: registro de arrays Dalvik lleno (%d), no se puede rastrear mas\n",
-            ZENONIA_DALVIK_REGISTRY_MAX);
+    if (!ptr) return;
+    unsigned int h = ((uintptr_t) ptr >> 3) & ZENONIA_DALVIK_HASH_MASK;
+    dalvik_node_t *cur = g_dalvik_hash[h];
+    while (cur) {
+        if (cur->ptr == ptr) return;
+        cur = cur->next;
     }
+    if (g_dalvik_count >= ZENONIA_DALVIK_REGISTRY_MAX) {
+        g_dalvik_count = 0;
+        memset(g_dalvik_hash, 0, sizeof(g_dalvik_hash));
+    }
+    dalvik_node_t *node = &g_dalvik_nodes[g_dalvik_count++];
+    node->ptr = ptr;
+    node->next = g_dalvik_hash[h];
+    g_dalvik_hash[h] = node;
 }
 
-static int zenonia_is_dalvik_array(void *ptr) {
-    for (int i = 0; i < g_dalvik_registry_count; i++) {
-        if (g_dalvik_registry[i] == ptr) return 1;
+static inline int zenonia_is_dalvik_array(void *ptr) {
+    if (!ptr || (uintptr_t) ptr < 0x80000000 || (uintptr_t) ptr >= 0x98000000) return 0;
+    unsigned int h = ((uintptr_t) ptr >> 3) & ZENONIA_DALVIK_HASH_MASK;
+    dalvik_node_t *cur = g_dalvik_hash[h];
+    while (cur) {
+        if (cur->ptr == ptr) return 1;
+        cur = cur->next;
     }
     return 0;
 }
@@ -335,61 +536,6 @@ volatile int g_ui_status = -1;
 // Dalvik (header de 16 bytes + datos crudos) en vez de usar
 // GetByteArrayElements -- mismo mecanismo confirmado para Zenonia 2, y
 // coherente con que Zenonia 3 sea el mismo motor (Fase 1).
-// --- Cache de assets en memoria ---
-//
-// Causa real confirmada de la lentitud reportada en consola (ver
-// port_progress.md): la pantalla de seleccion/preview de personaje
-// (dynamic/CharaterSelectUI, pc/000.pza, pc/head|armor|weapon|side_hand|
-// effect/...) vuelve a pedir el MISMO set de ~11 archivos una y otra vez
-// (confirmado con un log real: la secuencia completa se repite identica
-// decenas de veces por segundo) -- cada `readAssets` hacia una lectura de
-// disco real (`fopen`/`fstat`/`fread`/`fclose` contra `ux0:`, mucho mas
-// lento que el `AssetManager` de Android, que puede mapear directo el APK)
-// mas 3-4 lineas de log con `fflush` cada una. En Android esto probablemente
-// es barato porque `AssetManager` cachea/mapea el asset; ac { no hay ningun
-// cache, cada llamada repetia el trabajo completo.
-//
-// Fix: cachear los bytes crudos del archivo (no el `array_obj` con el header
-// Dalvik-style completo) la primera vez que se lee, y en cache hit copiar
-// desde memoria en vez de tocar disco. Se cachean los bytes CRUDOS y no el
-// `array_obj` ya armado porque el motor libera (`free()`) el `array_obj` que
-// le devolvemos despues de usarlo (via `DeleteGlobalRef`, ver FalsoJNI.c) --
-// devolver el mismo puntero dos veces seria un use-after-free/double-free.
-// Cada llamada arma un `array_obj` nuevo a partir de los bytes cacheados.
-#define ZENONIA_ASSET_CACHE_MAX 1024
-typedef struct {
-    char path[256];
-    unsigned char *data;
-    long size;
-} zenonia_asset_cache_entry_t;
-
-static zenonia_asset_cache_entry_t g_asset_cache[ZENONIA_ASSET_CACHE_MAX];
-static int g_asset_cache_count = 0;
-
-static zenonia_asset_cache_entry_t *zenonia_asset_cache_find(const char *path) {
-    for (int i = 0; i < g_asset_cache_count; i++) {
-        if (strcmp(g_asset_cache[i].path, path) == 0) return &g_asset_cache[i];
-    }
-    return NULL;
-}
-
-static void zenonia_asset_cache_store(const char *path, const unsigned char *data, long size) {
-    if (g_asset_cache_count >= ZENONIA_ASSET_CACHE_MAX) {
-        // Sin LRU real: el working set observado (los ~11 archivos de un
-        // personaje en el menu de seleccion) es chico comparado con
-        // ZENONIA_ASSET_CACHE_MAX, asi que un FIFO simple (descartar el mas
-        // viejo) alcanza sin la complejidad de trackear uso real.
-        free(g_asset_cache[0].data);
-        memmove(&g_asset_cache[0], &g_asset_cache[1], sizeof(g_asset_cache[0]) * (ZENONIA_ASSET_CACHE_MAX - 1));
-        g_asset_cache_count--;
-    }
-    zenonia_asset_cache_entry_t *e = &g_asset_cache[g_asset_cache_count++];
-    snprintf(e->path, sizeof(e->path), "%s", path);
-    e->data = (unsigned char *) malloc(size > 0 ? (size_t) size : 1);
-    if (e->data && size > 0) memcpy(e->data, data, size);
-    e->size = size;
-}
-
 jobject Zenonia_readAssets(jmethodID id, va_list args) {
     jstring filename = va_arg(args, jstring);
     const char *name = (const char *) filename;
@@ -401,17 +547,12 @@ jobject Zenonia_readAssets(jmethodID id, va_list args) {
         return NULL;
     }
 
-    // Log limitado a las primeras 200 lecturas -- con cache, la mayoria de
-    // las llamadas en juego real son hits repetidos (mismo personaje/menu),
-    // loguear cada una es puro costo de fflush() sin valor de diagnostico
-    // nuevo (ver nota de convert_rgb565_to_rgba8888 en dynlib.c, mismo
-    // criterio de "cap a las primeras N" ya usado para el log de GL).
     static int rd_log = 0;
     int do_log = rd_log < 200;
 
-    zenonia_asset_cache_entry_t *cached = zenonia_asset_cache_find(path);
-    long size;
-    const unsigned char *src;
+    zenonia_asset_node_t *cached = zenonia_asset_cache_find(path);
+    long size = 0;
+    const unsigned char *src = NULL;
     unsigned char *disk_buf = NULL;
 
     if (cached) {
@@ -424,17 +565,13 @@ jobject Zenonia_readAssets(jmethodID id, va_list args) {
             return NULL;
         }
 
-        // fstat en vez de fseek(SEEK_END)+ftell: en Zenonia 2, ftell() devolvio
-        // basura (bytes de la propia ruta) para al menos un archivo real y
-        // corrompio el malloc posterior del motor. fstat no depende de la
-        // posicion del cursor y evita esa clase de bug de raiz.
         struct stat st;
         size = -1;
         if (fstat(fileno(f), &st) == 0) {
             size = st.st_size;
         }
 
-        if (size < 0 || size > 64 * 1024 * 1024) { // ningun asset individual del juego deberia acercarse a 64MB
+        if (size < 0 || size > 64 * 1024 * 1024) {
             game_log("[Java] readAssets: bogus/oversized size %ld for %s, aborting\n", size, path);
             fclose(f);
             return NULL;
@@ -448,7 +585,7 @@ jobject Zenonia_readAssets(jmethodID id, va_list args) {
         fread(disk_buf, 1, size, f);
         fclose(f);
 
-        zenonia_asset_cache_store(path, disk_buf, size);
+        zenonia_asset_cache_store(path, disk_buf, size, 0);
         src = disk_buf;
     }
 
@@ -458,11 +595,12 @@ jobject Zenonia_readAssets(jmethodID id, va_list args) {
         return NULL;
     }
 
-    memset(array_obj, 0, 16); // header de ArrayObject de Dalvik en cero
-    // Dalvik ArrayObject espera el largo como entero de 32 bits en el offset 8
+    memset(array_obj, 0, 16);
     *(uint32_t *)((char *)array_obj + 8) = (uint32_t) size;
-    memcpy((char *) array_obj + 16, src, (size_t) size);
-    free(disk_buf); // libre en ambos casos: NULL en cache hit, buffer propio en miss (ya copiado al cache)
+    if (size > 0 && src) {
+        memcpy((char *) array_obj + 16, src, (size_t) size);
+    }
+    free(disk_buf);
 
     zenonia_register_dalvik_array(array_obj);
 
@@ -473,24 +611,24 @@ jobject Zenonia_readAssets(jmethodID id, va_list args) {
     return array_obj;
 }
 
-// Registrado porque un methodID no encontrado hace que methodIntCall() de
-// FalsoJNI devuelva -1 (ver FalsoJNI_ImplBridge.c) -- un valor no-cero que
-// el motor interpreta como booleano C "true" (el archivo existe). Ese falso
-// positivo fue la causa real de un crash en Zenonia 2 (§9.10 de su
-// port_progress.md): el motor seguia adelante cargando un archivo que en
-// realidad no se habia resuelto.
 jint Zenonia_isAssetExist(jmethodID id, va_list args) {
     jstring filename = va_arg(args, jstring);
     const char *name = (const char *) filename;
     if (!name) return 0;
 
     static int ie_log = 0;
-    int do_log = ie_log < 200; // ver nota de cache/log en Zenonia_readAssets
+    int do_log = ie_log < 200;
+
+    // 1. FAST PATH: Check RAM cache first
+    zenonia_asset_node_t *cached = zenonia_asset_cache_find(name);
+    if (cached) {
+        if (do_log) { game_log("[Java] isAssetExist: %s -> %ld (cache)\n", name, cached->size); ie_log++; }
+        return (jint) cached->size;
+    }
 
     char path[256];
     if (zenonia_resolve_asset_path(name, path, sizeof(path))) {
-        // Cache hit: el tamano ya se conoce, sin tocar disco de nuevo.
-        zenonia_asset_cache_entry_t *cached = zenonia_asset_cache_find(path);
+        cached = zenonia_asset_cache_find(path);
         if (cached) {
             if (do_log) { game_log("[Java] isAssetExist: %s -> %ld (cache)\n", name, cached->size); ie_log++; }
             return (jint) cached->size;

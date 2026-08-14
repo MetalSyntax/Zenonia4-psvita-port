@@ -370,16 +370,35 @@ static int CGxPZxZero_Blt_counter_hook(void *this_ptr, int p1, int p2, int p3, i
 #define ZENONIA_MIN_PLAUSIBLE_HEAP_ADDR 0x1000
 
 static so_hook g_putcompressimg_hook;
+static uintptr_t g_putcompress_resume_addr = 0;
+
+__attribute__((naked)) static void PutCompressImg_orig_trampoline(int p1, int p2, int p3, int p4, unsigned char *p5, unsigned short *p6, int op, int p8, long p9) {
+    __asm__ volatile (
+        "push {r4, r5, r6, r7, lr}\n"
+        "mov r7, r11\n"
+        "mov r6, r10\n"
+        "mov r5, r9\n"
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        ".align 2\n"
+        "1: .word g_putcompress_resume_addr\n"
+    );
+}
+
+extern volatile int g_frameskip_is_skip_frame;
 
 static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p5, unsigned short *p6, int op, int p8, long p9) {
+#ifdef ZENONIA_FRAMESKIP
+    if (g_frameskip_is_skip_frame && p9 == 0) {
+        return; // Salto de decodificacion y blit directo a FB en frames impares, preservando buffers offscreen
+    }
+#endif
 #ifdef ZENONIA_INSTRUMENT_HOTPATH
     g_putcompressimg_calls_this_frame++;
 #endif
 
 #ifdef ZENONIA_GPU_QUADS
     g_gpu_quads_calls_this_frame++;
-    // Fase 48: primera vez que se ve cada enumDrawOP real -- confirma o
-    // descarta si op==0 es realmente el caso comun de sprites jugables.
     {
         static int seen_op[256];
         int op_idx = (op >= 0 && op < 256) ? op : 255;
@@ -392,69 +411,35 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
 #endif
 
 #ifdef ZENONIA_SKIP_SPRITE_BLIT
-    // Variante 1 (--skip-blit-test): experimento de TECHO. PutCompressImg es el
-    // blitter real de sprites del motor (hot path confirmado: 445-547
-    // llamadas/frame en combate, Fase 38). Retornar sin dibujar nada mide el
-    // FPS maximo teorico si el costo del blit por software se eliminara por
-    // completo (los sprites simplemente no aparecen). NO es un build jugable --
-    // es la medicion que decide si vale la pena el offload a GPU (Variante 2):
-    //   - FPS salta a 30-60  -> el blit ES el cuello, la GPU vale la pena.
-    //   - FPS sigue en ~10   -> el cuello esta en otro lado (conversion/subida
-    //                           del framebuffer, o primitivas CGsGraphics).
-    // Se sigue contando (arriba) y no se llama al original. El hook queda
-    // instalado (no hace falta unhook/rehook porque no delegamos).
     (void)p1; (void)p2; (void)p3; (void)p4; (void)p5; (void)p6; (void)op; (void)p8; (void)p9;
     return;
 #endif
 
 #ifdef ZENONIA_GPU_QUADS
-    // Fase 50: TODOS los enumDrawOP se desvian a quads GPU (antes solo op==0,
-    // Fase 48), dibujados encima del FB base en el orden de llamada original.
-    // El decode reusa el blitter REAL del motor con el op REAL (nada de
-    // adivinar formatos por op, la leccion de la Fase 48): decode dual sobre
-    // fondo negro y blanco -> alpha por pixel exacto para cualquier operador
-    // afin en dest, textura premultiplicada (ver gpu_quads.h). Solo se desvia
-    // si p9==0 (destino = pantalla principal): si el motor esta componiendo
-    // hacia un buffer alternativo propio, se respeta el camino de software.
-    // Sprites que se salen del scratch (parcialmente fuera de pantalla, p.ej.
-    // tiles en los bordes con la camara en movimiento) tambien caen al camino
-    // de software: el motor los clippea y quedan en el FB base (debajo de los
-    // quads) -- aceptable porque los tiles no se solapan entre si.
     if (p9 == 0) {
         if (op == 0) g_gpu_quads_op0_calls_this_frame++;
         if (gpu_quads_lookup_and_enqueue(p5, p6, op, p8, p1, p2, p3, p4)) {
             g_gpu_quads_cache_hit_this_frame++;
-            return; // cache hit: quad encolado, no rasterizar por CPU
+            return; // cache hit: quad encolado, cero CPU rasterization
         }
         void *fake_fb = gpu_quads_begin_pass(p3, p4, 0x0000);
         if (!fake_fb) {
-            // Fase 51 (2026-07-20): diagnostico para el reporte del usuario de
-            // sprite del mapa/casas/bordes del mundo faltantes.
-            // NOTA: Con la correccion de Fase 54 (decodificar en 0,0), esto solo
-            // ocurre si el sprite es gigante (> GPU_QUADS_MAX_W).
             static int reject_log = 0;
             if (reject_log < 40) {
-                game_log("[GpuQuadsDiag] fallback a software: op=%d p1=%d p2=%d p3=%d p4=%d p8=%d (fuera del scratch 960x544 o sprite > 1024x1024, ver gpu_quads.h)\n",
+                game_log("[GpuQuadsDiag] fallback a software: op=%d p1=%d p2=%d p3=%d p4=%d p8=%d\n",
                          op, p1, p2, p3, p4, p8);
                 reject_log++;
             }
         }
         if (fake_fb) {
             g_gpu_quads_decoded_this_frame++;
-            int dual = (op != 2); // op 2 = additive: una sola pasada (gpu_quads.h)
-            so_unhook(&g_putcompressimg_hook);
-            void (*orig)(int, int, int, int, unsigned char *, unsigned short *, int, int, long) =
-                (void (*)(int, int, int, int, unsigned char *, unsigned short *, int, int, long))
-                (g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr);
-            orig(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada negra
+            int dual = (op != 2); // op 2 = additive: una sola pasada
+            PutCompressImg_orig_trampoline(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada negra
             if (dual) {
                 gpu_quads_capture_pass1(p3, p4);
                 gpu_quads_begin_pass(p3, p4, 0xFFFF);
-                orig(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada blanca
+                PutCompressImg_orig_trampoline(0, 0, p3, p4, p5, p6, op, p8, (long) fake_fb); // pasada blanca
             }
-            g_putcompressimg_hook = hook_addr(
-                g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr,
-                (uintptr_t) PutCompressImg_hook);
             gpu_quads_finish_decode(p5, p6, op, p8, p1, p2, p3, p4, dual);
             return; // quad encolado
         }
@@ -464,27 +449,17 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
     if (p9 != 0 && (unsigned long) p9 < ZENONIA_MIN_PLAUSIBLE_HEAP_ADDR) {
         static int guard_log = 0;
         if (guard_log < 20) {
-            game_log("[PutCompressImgGuard] param_9=0x%lx invalido (no NULL, no plausible) -- forzado a 0 (framebuffer principal), ver port_progress.md Fase 32\n", (unsigned long) p9);
+            game_log("[PutCompressImgGuard] param_9=0x%lx invalido -- forzado a 0\n", (unsigned long) p9);
             guard_log++;
         }
         p9 = 0;
     }
 #ifdef ZENONIA_SPRITE_DECODE_CACHE
-    // Fase 83: solo op==0 (COPY, mismo criterio conservador que GPU_QUADS
-    // usaba antes de la Fase 50) -- ver sprite_decode.c para el resto del
-    // mecanismo (consumido por DrawOP_COPY_Compress_16_Vita mas abajo en la
-    // misma llamada sincronica).
     if (op == 0) {
         sprite_cache_set_pending_dims(p5, p3, p4);
     }
 #endif
-    so_unhook(&g_putcompressimg_hook);
-    ((void (*)(int, int, int, int, unsigned char *, unsigned short *, int, int, long))
-        (g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr))
-        (p1, p2, p3, p4, p5, p6, op, p8, p9);
-    g_putcompressimg_hook = hook_addr(
-        g_putcompressimg_hook.thumb_addr ? g_putcompressimg_hook.thumb_addr : g_putcompressimg_hook.addr,
-        (uintptr_t) PutCompressImg_hook);
+    PutCompressImg_orig_trampoline(p1, p2, p3, p4, p5, p6, op, p8, p9);
 }
 
 // --- Fase 86 (port_progress.md): conteo de CGxFACharCache::DrawToFrameBuffer,
@@ -533,6 +508,9 @@ void zenonia_install_text_calls_probe(so_module *mod) {
 #else
 void zenonia_install_text_calls_probe(so_module *mod) { (void) mod; }
 #endif
+
+typedef int (*GcxGetMainScreenBuffer_fn)(void);
+static GcxGetMainScreenBuffer_fn g_GcxGetMainScreenBuffer = NULL;
 
 #ifdef ZENONIA_GPU_QUADS
 // --- Fase 59 (port_progress.md): CGxFACharCache::DrawToFrameBuffer -> quads GPU ---
@@ -681,34 +659,23 @@ void zenonia_install_text_quads_hook(so_module *mod) {
 // screen buffer antes de escribir -- no hace falta replicar ese clip aca (a
 // diferencia del clip de texto de la Fase 59, que es contra una ventana
 // LOCAL de dialogo, no la pantalla): un quad GL que cae fuera del viewport
-// simplemente no se rasteriza, mismo resultado.
 static so_hook g_rgbblend16_hook;
 
 static void Screen_RGBBLEND16_Real_hook(int x, int y, int w, int h, unsigned int color565, int alpha4) {
-    if (w <= 0 || h <= 0) return;
-    if (alpha4 < 0) alpha4 = 0;
+    if (alpha4 <= 0 || w <= 0 || h <= 0) return;
+    if (x >= 960 || y >= 544 || x + w <= 0 || y + h <= 0) return;
     if (alpha4 > 15) alpha4 = 15;
-    int alpha8 = (alpha4 * 255) / 15;
 
-    int r5 = (color565 >> 11) & 0x1F, g6 = (color565 >> 5) & 0x3F, b5 = color565 & 0x1F;
-    unsigned char r8 = (unsigned char) ((r5 << 3) | (r5 >> 2));
-    unsigned char g8 = (unsigned char) ((g6 << 2) | (g6 >> 4));
-    unsigned char b8 = (unsigned char) ((b5 << 3) | (b5 >> 2));
-
-    // Fase 63/64 (diagnostico ya retirado, port_progress.md): confirmo que
-    // este mecanismo SI se llama durante gameplay real -- entre otras cosas,
-    // el minimapa se dibuja como CIENTOS de bloques individuales de 4x4/4x20
-    // pixeles (un RGBBlend16 por punto de terreno/marcador), no como un solo
-    // sprite/relleno -- volumen mucho mayor de lo esperado. El log del
-    // diagnostico confirmo esto pero su propio costo (scan lineal de 128
-    // entradas EN CADA llamada, para siempre, no solo las primeras N) se
-    // sumaba al de convertir cada uno de esos cientos de bloques en un quad
-    // GPU -- contribuyo al bajon de FPS reportado en un area nueva con mucho
-    // detalle de minimapa. Retirado -- ya cumplio su proposito.
-    gpu_quads_enqueue_fill(r8, g8, b8, (unsigned char) alpha8, x, y, w, h);
-    // Nunca se llama al original -- el quad reemplaza el efecto visual
-    // completo, la capa base de software queda limpia (mismo criterio que
-    // DrawToFrameBuffer_hook, Fase 59).
+    // Solo cajas de dialogo reales, popups de guardado/tips y fondos translucidos de UI (w >= 64 && h >= 32)
+    // Se excluyen tiles de mapa/terreno (16x16, 32x32) y scanlines de minimapa (1x1 a 4x4) que se dibujan en CPU
+    if (w >= 64 && h >= 32) {
+        int alpha8 = (alpha4 * 255) / 15;
+        int r5 = (color565 >> 11) & 0x1F, g6 = (color565 >> 5) & 0x3F, b5 = color565 & 0x1F;
+        unsigned char r8 = (unsigned char) ((r5 << 3) | (r5 >> 2));
+        unsigned char g8 = (unsigned char) ((g6 << 2) | (g6 >> 4));
+        unsigned char b8 = (unsigned char) ((b5 << 3) | (b5 >> 2));
+        gpu_quads_enqueue_fill(r8, g8, b8, (unsigned char) alpha8, x, y, w, h);
+    }
 }
 
 // --- Fase 62 (port_progress.md): CGsGraphics::DrawNativeFillEllipse -> quads GPU ---
@@ -748,20 +715,27 @@ static void Screen_RGBBLEND16_Real_hook(int x, int y, int w, int h, unsigned int
 // desvia cuando `quadrant` tiene EXACTAMENTE UN bit prendido (1/2/4/8 --
 // el patron real de las 4 llamadas de esquina en DrawFillRoundRect); para
 // cualquier otro valor (0xf u otra combinacion) se delega al original, sin
-// cambiar el comportamiento actual (ni mejor ni peor que antes de este fix).
-static so_hook g_drawnativefillellipse_hook;
+static uintptr_t g_drawnativefillellipse_resume_addr = 0;
+
+__attribute__((naked)) static void DrawNativeFillEllipse_orig_trampoline(void *this_ptr, int x, int y, int w, int h,
+                                                                         unsigned int color, int quadrant) {
+    __asm__ volatile (
+        "push {r4, r5, r6, r7, lr}\n"
+        "sub sp, #116\n"
+        "adds r0, r1, #0\n"
+        "str r1, [sp, #108]\n"
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        ".align 2\n"
+        "1: .word g_drawnativefillellipse_resume_addr\n"
+    );
+}
 
 static void DrawNativeFillEllipse_hook(void *this_ptr, int x, int y, int w, int h,
                                         unsigned int color, int quadrant) {
     int is_single_corner = quadrant != 0 && (quadrant & (quadrant - 1)) == 0;
     if (!is_single_corner) {
-        so_unhook(&g_drawnativefillellipse_hook);
-        ((void (*)(void *, int, int, int, int, unsigned int, int))
-            (g_drawnativefillellipse_hook.thumb_addr ? g_drawnativefillellipse_hook.thumb_addr : g_drawnativefillellipse_hook.addr))
-            (this_ptr, x, y, w, h, color, quadrant);
-        g_drawnativefillellipse_hook = hook_addr(
-            g_drawnativefillellipse_hook.thumb_addr ? g_drawnativefillellipse_hook.thumb_addr : g_drawnativefillellipse_hook.addr,
-            (uintptr_t) DrawNativeFillEllipse_hook);
+        DrawNativeFillEllipse_orig_trampoline(this_ptr, x, y, w, h, color, quadrant);
         return;
     }
 
@@ -778,28 +752,74 @@ static void DrawNativeFillEllipse_hook(void *this_ptr, int x, int y, int w, int 
         g8 = (unsigned char) (color >> 8);
         b8 = (unsigned char) color;
     }
-    // Fase 63/64: diagnostico ya retirado, ver el comentario en
-    // Screen_RGBBLEND16_Real_hook -- cumplio su proposito, su propio costo
-    // (scan lineal en cada llamada) contribuia al bajon de FPS.
 
     gpu_quads_enqueue_fill(r8, g8, b8, a8, x, y, w, h);
 }
 
+static uintptr_t g_drawnative_resume_addr = 0;
+
+__attribute__((naked)) static void DrawNative_orig_trampoline(long bitmap_desc, int dst_x, int dst_y, int dst_w, int dst_h,
+                                                              int src_x, int src_y, int op, int alpha, unsigned char ck) {
+    __asm__ volatile (
+        "push {r4, r5, r6, r7, lr}\n"
+        "mov r7, r11\n"
+        "mov r6, r10\n"
+        "mov r5, r9\n"
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        ".align 2\n"
+        "1: .word g_drawnative_resume_addr\n"
+    );
+}
+
+static void DrawNative_hook(long bitmap_desc, int dst_x, int dst_y, int dst_w, int dst_h,
+                            int src_x, int src_y, int op, int alpha, unsigned char ck) {
+    // Interceptar minimapa (esquina superior derecha: dst_x >= 700, dst_y <= 10)
+    // para dibujarlo como quad GPU encima de los quads de terreno
+    if (bitmap_desc && dst_x >= 700 && dst_y <= 10 && dst_w > 0 && dst_h > 0) {
+        int bw = *(int *) bitmap_desc;
+        int bh = *(int *) (bitmap_desc + 4);
+        uint16_t *pixels = *(uint16_t **) (bitmap_desc + 0x10);
+        if (bw > 0 && bh > 0 && pixels) {
+            int sw = (dst_w > 0 && dst_w <= bw) ? dst_w : bw;
+            int sh = (dst_h > 0 && dst_h <= bh) ? dst_h : bh;
+            gpu_quads_enqueue_rgb565(pixels, bw, bh, src_x, src_y, sw, sh, dst_x, dst_y, sw, sh, alpha);
+        }
+    }
+
+    DrawNative_orig_trampoline(bitmap_desc, dst_x, dst_y, dst_w, dst_h, src_x, src_y, op, alpha, ck);
+}
+
 void zenonia_install_screen_fill_quads_hook(so_module *mod) {
+    uintptr_t gcx_addr = so_symbol(mod, "GcxGetMainScreenBuffer");
+    if (gcx_addr) {
+        g_GcxGetMainScreenBuffer = (GcxGetMainScreenBuffer_fn) gcx_addr;
+    }
     uintptr_t addr = so_symbol(mod, "_Z22Screen_RGBBLEND16_Realiiiiji");
     if (addr) {
         g_rgbblend16_hook = hook_addr(addr, (uintptr_t) Screen_RGBBLEND16_Real_hook);
-        game_log("[FillQuads] hook instalado en Screen_RGBBLEND16_Real (0x%08x)\n", (unsigned int) addr);
+        game_log("[FillQuads] hook instalado en Screen_RGBBLEND16_Real (0x%08x), GcxGetMainScreenBuffer=0x%08x\n",
+                 (unsigned int) addr, (unsigned int) gcx_addr);
     } else {
         game_log("[FillQuads] simbolo Screen_RGBBLEND16_Real no encontrado -- los rellenos solidos (fondos de dialogo, etc.) siguen con el bug de orden de capas\n");
     }
 
     uintptr_t ellipse_addr = so_symbol(mod, "_ZN11CGsGraphics21DrawNativeFillEllipseEiiiij17EnumGsDegreeCCW90");
     if (ellipse_addr) {
-        g_drawnativefillellipse_hook = hook_addr(ellipse_addr, (uintptr_t) DrawNativeFillEllipse_hook);
-        game_log("[FillQuads] hook instalado en DrawNativeFillEllipse (0x%08x)\n", (unsigned int) ellipse_addr);
+        g_drawnativefillellipse_resume_addr = (ellipse_addr & ~1) + 8 + 1;
+        hook_addr(ellipse_addr, (uintptr_t) DrawNativeFillEllipse_hook);
+        game_log("[FillQuads] hook + trampolin zero-syscall instalado en DrawNativeFillEllipse (0x%08x -> 0x%08x)\n",
+                 (unsigned int) ellipse_addr, (unsigned int) g_drawnativefillellipse_resume_addr);
     } else {
         game_log("[FillQuads] simbolo DrawNativeFillEllipse no encontrado -- esquinas redondeadas grandes siguen con el bug de orden de capas\n");
+    }
+
+    uintptr_t drawnative_addr = so_symbol(mod, "_Z10DrawNativeliiiiii10enumDrawOPih");
+    if (drawnative_addr) {
+        g_drawnative_resume_addr = (drawnative_addr & ~1) + 8 + 1;
+        hook_addr(drawnative_addr, (uintptr_t) DrawNative_hook);
+        game_log("[DrawNative] hook + trampolin zero-syscall instalado en DrawNative (0x%08x -> 0x%08x)\n",
+                 (unsigned int) drawnative_addr, (unsigned int) g_drawnative_resume_addr);
     }
 
     so_flush_caches(mod);
@@ -832,8 +852,10 @@ void zenonia_install_hotpath_probe(so_module *mod) {
 
     uintptr_t putcompress_addr = so_symbol(mod, "_Z14PutCompressImgiiiiPhPt10enumDrawOPil");
     if (putcompress_addr) {
+        g_putcompress_resume_addr = (putcompress_addr & ~1) + 8 + 1; // Thumb address + 8 bytes
         g_putcompressimg_hook = hook_addr(putcompress_addr, (uintptr_t) PutCompressImg_hook);
-        game_log("[PutCompressImgGuard] hook instalado en PutCompressImg (0x%08x)\n", (unsigned int) putcompress_addr);
+        game_log("[PutCompressImgGuard] hook + trampoline zero-syscall instalado en PutCompressImg (0x%08x -> 0x%08x)\n",
+                 (unsigned int) putcompress_addr, (unsigned int) g_putcompress_resume_addr);
     } else {
         game_log("[PutCompressImgGuard] simbolo PutCompressImg no encontrado -- guardia de crash de la Fase 32 NO esta activa\n");
     }
@@ -1206,15 +1228,12 @@ void zenonia_install_cgsgraphics_probe(so_module *mod) {
 // ningun caller confirmado lo consume, pero se replica igual por las dudas
 // (misma leccion de la Fase 38: no asumir que un valor de retorno no importa).
 #ifdef ZENONIA_FASTCLEAR_OPTIMIZE
-// GcxGetMainScreenBuffer vive dentro de libgameDSO.so (simbolo global sin
-// mangling C++, ver "int GcxGetMainScreenBuffer(void);" en out_ghidra.h) -- no
-// esta linkeado con nuestro loader, hay que resolverlo con so_symbol() en la
-// instalacion del hook y llamarlo a traves de un puntero a funcion, igual que
-// PutCompressImg_hook/etc. llaman al original.
-typedef int (*GcxGetMainScreenBuffer_fn)(void);
-static GcxGetMainScreenBuffer_fn g_GcxGetMainScreenBuffer = NULL;
-
 static long long CGsGraphics_FastClearNonClipping_neon_hook(void *this_ptr, int x, int y, int w, int h) {
+#ifdef ZENONIA_FRAMESKIP
+    if (g_frameskip_is_skip_frame) {
+        return (long long)(((unsigned long long)(w) << 32) | (uintptr_t)this_ptr);
+    }
+#endif
     intptr_t this_i = (intptr_t) this_ptr;
     int *field8 = *(int **) (this_i + 8);
     int row_off = field8[0x11];
@@ -1531,7 +1550,7 @@ static void upload_rgb565_interlaced(GLenum target, GLint level, GLint xoffset, 
 // GL persiste entre llamadas y frames. Sin esto, el siguiente draw del motor
 // salia con punteros colgantes y arrays deshabilitados (la causa raiz de "los
 // textos no aparecen" de la Fase 49, log_1784510991.txt).
-static GLuint g_engine_bound_tex = 0;
+GLuint g_engine_bound_tex = 0;
 static GLenum g_engine_blend_src = GL_ONE;
 static GLenum g_engine_blend_dst = GL_ZERO;
 static int g_engine_blend_on = 0;
@@ -1633,31 +1652,24 @@ void glTexImage2D_wrapper(GLenum target, GLint level, GLint internalformat, GLsi
 
 void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
 #ifdef ZENONIA_GPU_QUADS
-    // Fase 76: ver el comentario largo en glTexImage2D_wrapper -- mismo hueco,
-    // mismo fix. Esta es la llamada que realmente crashea en los 3 `.psp2dmp`
-    // (siempre LR dentro de esta funcion en vitaGL) -- la subida del
-    // framebuffer RGB565 del motor, que corre una vez por frame y opera sobre
-    // "lo que este bindeado ahora", sin re-bindear su propia textura primero.
-    //
-    // Fase 90/91 (port_progress.md): se probo agregar un diagnostico con
-    // glGetIntegerv(GL_TEXTURE_BINDING_2D, ...) justo aca para comparar la
-    // textura REALMENTE bindeada contra `g_engine_bound_tex` -- el usuario
-    // reporto que el build con ese diagnostico colgo la CONSOLA ENTERA
-    // (no un crash de app, sin `.psp2dmp`) jugando con GPU_QUADS, un
-    // sintoma mas grave que los 6 crashes de app ya documentados. REVERTIDO
-    // de inmediato como precaucion (ver Fase 91): `glGetIntegerv` puede
-    // forzar una sincronizacion/flush del pipeline de la GPU real -- si el
-    // estado de la cola de comandos ya estaba comprometido (el mismo
-    // territorio que la Fase 81 ya vio colgar la consola con
-    // DISABLE_VSYNC+GPU_QUADS), agregar una sincronizacion extra en ese
-    // momento exacto es un candidato plausible para convertir un crash
-    // recuperable (con dump) en un cuelgue real de hardware (sin dump, sin
-    // poder diagnosticar). No confirmado con certeza total (no se pudo
-    // probar la hipotesis alternativa por seguridad), pero el costo de
-    // sacarlo es cero y el riesgo de dejarlo es alto -- no se vuelve a
-    // agregar ninguna llamada que pueda sincronizar/esperar a la GPU en
-    // este call site sin antes confirmar que es segura.
+    // Re-bindear la textura propia del motor (trackeada en g_engine_bound_tex)
+    // para asegurar que la subida RGB565 del framebuffer opere sobre su textura RGB565
+    // y no sobre el Atlas RGBA8888 de GPU_QUADS, evitando el crash PC=0x0 en vitaGL.
+    glBindTexture(GL_TEXTURE_2D, g_engine_bound_tex);
 #endif
+
+    // Salto de subida de 1MB SOLO en Menu Principal HD (g_ui_status == 2).
+    // El Title (g_ui_status == 1) y Logo (-1) usan NativeRender y deben dibujarse.
+    if (g_ui_status == 2) {
+        return;
+    }
+
+#ifdef ZENONIA_FRAMESKIP
+    if (g_frameskip_is_skip_frame) {
+        return;
+    }
+#endif
+
     static int subimg_log = 0;
     if (subimg_log < 10) {
         game_log("[GL] glTexSubImage2D target=%x w=%d h=%d format=%x type=%x\n", target, width, height, format, type);
@@ -1730,6 +1742,18 @@ static GLfloat *fixed_texcoord_buf = NULL;
 static int fixed_texcoord_buf_cap = 0;
 
 void glDrawArrays_wrapper(GLenum mode, GLint first, GLsizei count) {
+    // Salto de dibujo de framebuffer base SOLO en Menu Principal HD (g_ui_status == 2).
+    // El Title (g_ui_status == 1) y Logo (-1) usan NativeRender y deben dibujarse.
+    if (g_ui_status == 2) {
+        return;
+    }
+
+#ifdef ZENONIA_FRAMESKIP
+    if (g_frameskip_is_skip_frame) {
+        return;
+    }
+#endif
+
     static int draw_count = 0;
     if (draw_count < 10) {
         game_log("[GL] glDrawArrays mode=%x first=%d count=%d\n", mode, first, count);
@@ -2432,10 +2456,19 @@ int stat_hook(const char* path, void* statbuf) {
     return res;
 }
 
+extern int zenonia_asset_cache_exists(const char *path);
+
 int access_hook(const char* path, int amode) {
     char new_path[256];
     translate_path(path, new_path, sizeof(new_path));
-    game_log("[FakeJNI] access_hook: %s -> %s\n", path, new_path);
+    if (zenonia_asset_cache_exists(new_path) || zenonia_asset_cache_exists(path)) {
+        return 0; // Asset presente en RAM VFS: cero I/O de disco
+    }
+    static int acc_log = 0;
+    if (acc_log < 30) {
+        game_log("[FakeJNI] access_hook: %s -> %s\n", path, new_path);
+        acc_log++;
+    }
     return access(new_path, amode);
 }
 

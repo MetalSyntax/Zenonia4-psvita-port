@@ -100,6 +100,10 @@ void gpu_quads_enqueue_text(const unsigned char *alpha, int aw,
 void gpu_quads_enqueue_fill(unsigned char r, unsigned char g, unsigned char b, unsigned char a,
                              int screen_x, int screen_y, int w, int h);
 
+void gpu_quads_enqueue_rgb565(const uint16_t *pixels, int bw, int bh,
+                             int sx, int sy, int sw, int sh,
+                             int dx, int dy, int dw, int dh, int alpha);
+
 // Fase 69 (2026-07-23): borra TODAS las entradas de la cache de texturas
 // (glDeleteTextures + reset de metadata) y el atajo MRU de
 // gpu_quads_enqueue_fill. Llamar en una transicion de stage (ver

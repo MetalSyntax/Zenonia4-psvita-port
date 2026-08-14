@@ -39,6 +39,8 @@ flag_desc() {
         --skip-blit-test) echo "Variante 1: techo de FPS teorico (PutCompressImg no-op, sprites no se dibujan)" ;;
         --gpu-quads-test) echo "Variante 2: offload de sprites PutCompressImg a quads texturizados por GPU (vitaGL)" ;;
         --downsample-test) echo "Variante 3: resolucion interna reducida + upscale GPU (pide ratio DS_NUM/DS_DEN)" ;;
+        --turbo-nologs) echo "Variante Turbo SIN LOGS: Maxima velocidad CPU (cero I/O a SD, cero format strings)" ;;
+        --turbo-opt) echo "Variante Turbo: FrameSkip 1.0x-3.0x + FastClear Bypass + NEON libc" ;;
         --primitives-opt-test) echo "Variante 4: FastClearNonClipping reimplementado + memcpy/memset NEON juntos" ;;
         *) echo "(sin descripcion corta -- ver el comentario de este flag en build.sh)" ;;
     esac
@@ -60,16 +62,22 @@ for f in "${FLAGS[@]}"; do
     printf "  %d) %-24s -- %s\n" "$i" "$f" "$(flag_desc "$f")"
     i=$((i + 1))
 done
+echo "  q) [ Cancelar / Regresar al menu principal ]"
 echo ""
-read -p "Numero de opcion [0]: " FLAG_CHOICE
+read -p "Numero de opcion [0, q para cancelar]: " FLAG_CHOICE
 FLAG_CHOICE="${FLAG_CHOICE:-0}"
+
+if [ "$FLAG_CHOICE" = "q" ] || [ "$FLAG_CHOICE" = "Q" ] || [ "$FLAG_CHOICE" = "c" ] || [ "$FLAG_CHOICE" = "cancel" ]; then
+    echo "[*] Operacion cancelada. Regresando al menu principal..."
+    exit 0
+fi
 
 BUILD_FLAG=""
 if [ "$FLAG_CHOICE" != "0" ]; then
     idx=$((FLAG_CHOICE - 1))
     if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#FLAGS[@]}" ]; then
-        echo "Opcion invalida."
-        exit 1
+        echo "Opcion invalida. Regresando..."
+        exit 0
     fi
     BUILD_FLAG="${FLAGS[$idx]}"
 fi

@@ -132,9 +132,9 @@ def list_local_vpks():
 
 
 def choose_vpk():
-    """Si hay un solo VPK lo usa directo; si hay varios, muestra un menu
+    """Si hay un solo VPK lo usa directo tras confirmacion; si hay varios, muestra un menu
     (tamano + fecha de modificacion para distinguir variantes de un vistazo)
-    y deja elegir -- Enter usa el mas reciente."""
+    y deja elegir -- 0 o 'q' regresa al menu principal."""
     vpks = list_local_vpks()
     if not vpks:
         print(f"[-] No se encontró ningún .vpk en '{BUILD_DIR}/'. Compilá el proyecto primero "
@@ -142,7 +142,13 @@ def choose_vpk():
         return None
 
     if len(vpks) == 1:
-        print(f"[*] Un solo VPK encontrado: {os.path.basename(vpks[0])}")
+        size_mb = os.path.getsize(vpks[0]) / (1024 * 1024)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(vpks[0])))
+        print(f"[*] Un solo VPK encontrado: {os.path.basename(vpks[0])} ({size_mb:.2f} MB, {mtime})")
+        choice = input("¿Deseas subir este VPK a la PS Vita? [S/n] (0 / 'q' para volver al menú): ").strip().lower()
+        if choice in ['0', 'q', 'n', 'no', 'c', 'cancel', 'r', 'volver']:
+            print("[*] Operación cancelada. Regresando al menú principal...")
+            return None
         return vpks[0]
 
     print(f"[*] Se encontraron {len(vpks)} VPKs en '{BUILD_DIR}/' (más reciente primero):")
@@ -150,18 +156,21 @@ def choose_vpk():
         size_mb = os.path.getsize(path) / (1024 * 1024)
         mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(path)))
         print(f"  {i}. {os.path.basename(path):<40} {size_mb:6.2f} MB   {mtime}")
-    print()
+    print(f"  0. [ Regresar al menú principal / Cancelar ]\n")
 
-    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}] (Enter = el más reciente): ").strip()
+    choice = input(f"Elegí el VPK a subir [1-{len(vpks)}, 0 para volver] (Enter = el más reciente): ").strip()
     if not choice:
         return vpks[0]
+    if choice.lower() in ['0', 'q', 'n', 'no', 'c', 'cancel', 'r', 'volver']:
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return None
     try:
         idx = int(choice)
         if 1 <= idx <= len(vpks):
             return vpks[idx - 1]
     except ValueError:
         pass
-    print("[-] Opción inválida.")
+    print("[-] Opción inválida. Regresando al menú principal...")
     return None
 
 
@@ -202,6 +211,15 @@ def upload_eboot():
         print(f"[-] No se encontró '{local_eboot_path}'. Asegúrate de haber compilado el proyecto.")
         return
 
+    size_kb = os.path.getsize(local_eboot_path) / 1024
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(local_eboot_path)))
+    print(f"[*] eboot.bin encontrado: {size_kb:.1f} KB ({mtime})")
+    
+    choice = input("¿Deseas subir SOLO el eboot.bin a ux0:/app/PSVZ00004/? [S/n] (0 / 'q' para volver al menú): ").strip().lower()
+    if choice in ['0', 'q', 'n', 'no', 'c', 'cancel', 'r', 'volver']:
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return
+
     disconnect_proton_vpn()
     ftp = connect_ftp()
     if not ftp:
@@ -227,6 +245,11 @@ def upload_eboot():
             pass
 
 def download_latest_debug_files():
+    choice = input("¿Deseas conectar a la PS Vita y buscar crash dumps y logs? [S/n] (0 / 'q' para volver al menú): ").strip().lower()
+    if choice in ['0', 'q', 'n', 'no', 'c', 'cancel', 'r', 'volver']:
+        print("[*] Operación cancelada. Regresando al menú principal...")
+        return
+
     disconnect_proton_vpn()
     ftp = connect_ftp()
     if not ftp:

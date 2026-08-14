@@ -4,6 +4,7 @@
 #include "so_util.h"
 
 extern void game_log(const char *fmt, ...);
+extern volatile int g_ui_status;
 
 // Fase 83 (port_progress.md): candidato 4 (threading acotado) reencuadrado
 // tras confirmar que PutCompressImg SI recibe w/h explicitos
@@ -55,6 +56,7 @@ volatile unsigned int g_sprite_cache_misses_this_frame = 0;
 #define SPRITE_CACHE_CAP 256
 typedef struct {
     const void *src;
+    const void *pal;
     unsigned long hash;
     int w, h;
     uint16_t *pixels;
@@ -74,8 +76,19 @@ void sprite_cache_set_pending_dims(const void *src, int w, int h) {
     g_pending_h = h;
 }
 
-static unsigned long sc_hash(const void *src, int w, int h) {
+static unsigned long sc_hash(const void *src, const void *pal, int w, int h) {
     unsigned long hv = (unsigned long) src * 2654435761u;
+    // Fase 99: la paleta DEBE ser parte de la clave -- el mismo `src`
+    // (forma/indices comprimidos) puede dibujarse con paletas distintas
+    // (recoloreo de sprites, tecnica comun para no duplicar formas), y el
+    // color final depende de `pal[*p_src]`, no solo de `src`. gpu_quads.c
+    // (gq_hash, mecanismo gemelo) ya incluye `pal` en su clave -- esta cache
+    // no lo hacia, asi que un hit servia colores de la PRIMERA paleta que
+    // poblo la entrada para cualquier paleta posterior. Invisible mientras el
+    // hit rate real era ~0% (Fase 95); confirmado como corrupcion de color
+    // real en consola apenas el fix de la Fase 97 hizo que la cache
+    // empezara a acertar de verdad (~99% hit rate).
+    hv ^= (unsigned long) pal * 40503u;
     hv ^= (unsigned long) w * 8191u;
     hv ^= (unsigned long) h * 97u;
     // Mismo criterio que gq_hash (gpu_quads.c, Fase 55): solo sampleamos
@@ -91,12 +104,12 @@ static unsigned long sc_hash(const void *src, int w, int h) {
     return hv;
 }
 
-static sc_entry *sc_find(const void *src, int w, int h, unsigned long hash_val) {
+static sc_entry *sc_find(const void *src, const void *pal, int w, int h, unsigned long hash_val) {
     unsigned long start = hash_val % SPRITE_CACHE_CAP;
     for (int i = 0; i < SPRITE_CACHE_CAP; i++) {
         sc_entry *e = &g_sprite_cache[(start + i) % SPRITE_CACHE_CAP];
         if (!e->used) return NULL;
-        if (e->src == src && e->w == w && e->h == h && e->hash == hash_val) return e;
+        if (e->src == src && e->pal == pal && e->w == w && e->h == h && e->hash == hash_val) return e;
     }
     return NULL;
 }
@@ -109,7 +122,7 @@ static void sc_free_entry(sc_entry *e) {
     e->used = 0;
 }
 
-static sc_entry *sc_alloc_slot(const void *src, int w, int h, unsigned long hash_val) {
+static sc_entry *sc_alloc_slot(unsigned long hash_val) {
     unsigned long start = hash_val % SPRITE_CACHE_CAP;
     for (int i = 0; i < SPRITE_CACHE_CAP; i++) {
         sc_entry *e = &g_sprite_cache[(start + i) % SPRITE_CACHE_CAP];
@@ -162,6 +175,12 @@ static void sc_decode_and_populate(uint16_t *restrict dest, const uint8_t *restr
     uint8_t *cache_mask = (uint8_t *) calloc((size_t) capacity, 1);
     int cache_valid = (cache_px != NULL && cache_mask != NULL);
     int cache_idx = 0;
+    // Fase 97: `cur_row` separado de `cache_idx` -- ver comentario largo junto
+    // al uso de abajo. Necesario porque `cache_idx` por si solo no alcanza
+    // para reproducir la semantica real de 0xfffe (filas en blanco
+    // consecutivas quedan indistinguibles de "ya estoy alineado, no hacer
+    // nada" si se intenta derivar la fila actual dividiendo cache_idx/w).
+    int cur_row = 0;
 
     const uint8_t *p_src = src;
     uint16_t token;
@@ -174,8 +193,36 @@ static void sc_decode_and_populate(uint16_t *restrict dest, const uint8_t *restr
         if (token == 0xfffe) {
             dest += stride;
             if (cache_valid) {
-                int row = cache_idx / w;
-                cache_idx = (row + 1) * w;
+                // Fase 96: primer intento de fix (0% hit rate medido en
+                // consola) redondeaba `cache_idx` hacia arriba SOLO si no
+                // estaba ya alineado a un multiplo de `w` -- arreglaba el
+                // caso "fila ya completa" (el decoder real solo hace
+                // `dest += stride` sin redondeo, incondicional) pero rompia
+                // un caso DISTINTO: dos o mas 0xfffe SEGUIDOS sin contenido
+                // entre medio (varias filas en blanco consecutivas). En ese
+                // caso el segundo 0xfffe encuentra `cache_idx` YA alineado
+                // (por el primero) y el fix de la Fase 96 no avanzaba nada --
+                // perdiendo esa fila en blanco silenciosamente (no dispara
+                // `cache_valid=0`, asi que el error no se nota como cache
+                // rechazada sino como PIXELES CORRIDOS una fila entera al
+                // reproducir el hit -- corrupcion visual real, confirmada en
+                // consola con `--sprite-decode-cache-test` la sesion
+                // siguiente al fix de la Fase 96).
+                //
+                // Fix real (Fase 97): reproducir la semantica EXACTA del
+                // decoder real -- cada 0xfffe es "avanzar UNA fila", punto,
+                // sin importar cuanto contenido tenia la fila anterior ni
+                // cuantos 0xfffe seguidos aparezcan. `cur_row` es un contador
+                // separado que se incrementa SIEMPRE (nunca se deriva de
+                // `cache_idx`), y `cache_idx` se recalcula como
+                // `cur_row * w` -- si la fila ya estaba exactamente llena,
+                // esto da el mismo valor que ya tenia (sin salto extra); si
+                // la fila estaba parcialmente llena, redondea hacia arriba
+                // (descarta el resto transparente implicito); si hay varias
+                // filas en blanco seguidas, cada 0xfffe avanza una fila mas
+                // sin importar que la anterior ya haya "alineado" cache_idx.
+                cur_row++;
+                cache_idx = cur_row * w;
                 if (cache_idx > capacity) cache_valid = 0;
             }
             continue;
@@ -208,8 +255,9 @@ static void sc_decode_and_populate(uint16_t *restrict dest, const uint8_t *restr
     if (cache_valid) {
         // sc_alloc_slot ya garantiza un slot sin usar (libera la entrada
         // desalojada internamente si hizo falta) -- ver mas arriba.
-        sc_entry *slot = sc_alloc_slot(src, w, h, hash_val);
+        sc_entry *slot = sc_alloc_slot(hash_val);
         slot->src = src;
+        slot->pal = pal;
         slot->hash = hash_val;
         slot->w = w;
         slot->h = h;
@@ -365,13 +413,37 @@ void DrawOP_COPY_Compress_16_Vita(uint16_t *restrict dest, const uint8_t *restri
     // nos trajo hasta aca (ver comentario extenso mas arriba). Si no
     // coincide (llamada desde otro lado, o el stash no se seteo), cae al
     // camino de siempre sin cache -- cero riesgo.
-    if (g_pending_src == src && g_pending_w > 0 && g_pending_h > 0) {
+    //
+    // Fase 100 (port_progress.md): la UNICA senal de invalidacion real
+    // (sprite_cache_invalidate(), java.c) dispara con `status==19`, y
+    // `g_ui_status` arranca en -1 (java.c) y se queda asi hasta que el motor
+    // emite su primer `OnUIStatusChange` real -- es decir, durante TODA la
+    // fase de splash/logo de Gamevil, esta cache no tiene NINGUN checkpoint
+    // de invalidacion. Esa fase es ademas el peor caso posible para el
+    // fingerprint debil de esta cache (puntero + 4 bytes muestreados + w + h
+    // + pal): una animacion de logo tipicamente redecodifica CONTENIDO NUEVO
+    // en la MISMA direccion de heap frame a frame, y streams RLE de sprites
+    // relacionados (mismo margen/borde) suelen compartir los primeros bytes
+    // -- exactamente la situacion que el comentario de sc_hash ya identificaba
+    // como riesgo conocido ("puntero reciclado con contenido nuevo"), pero
+    // aca sin ninguna ventana de invalidacion que lo acote. HIPOTESIS
+    // (inferida de logs + estructura, NO confirmada con un diagnostico
+    // dedicado) para "texturas rotas/blancas/negras desde el title de
+    // Gamevil" reportado en consola -- peor que el build default, cuya UNICA
+    // diferencia de codigo con este es justamente esta cache. Sigue
+    // pendiente confirmar en consola que esta mitigacion realmente lo
+    // resuelve. No hay beneficio real de cachear una pantalla que se ve una
+    // sola vez por unos segundos de cualquier forma, asi que se salta la cache
+    // por completo mientras `g_ui_status == -1` -- cae al mismo camino de
+    // decode sin cache de siempre, cero riesgo, cero costo el resto del
+    // tiempo (la comparacion es un entero, no una syscall/llamada).
+    if (g_ui_status != -1 && g_pending_src == src && g_pending_w > 0 && g_pending_h > 0) {
         int w = g_pending_w, h = g_pending_h;
         g_pending_src = NULL; // consumo unico, evita reuso stale
         g_pending_w = 0;
         g_pending_h = 0;
-        unsigned long hash_val = sc_hash(src, w, h);
-        sc_entry *hit = sc_find(src, w, h, hash_val);
+        unsigned long hash_val = sc_hash(src, pal, w, h);
+        sc_entry *hit = sc_find(src, pal, w, h, hash_val);
         if (hit) {
             g_sprite_cache_hits_this_frame++;
             sc_replay(hit, dest, stride);

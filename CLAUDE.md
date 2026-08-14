@@ -2,8 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-**This file describes the CURRENT, ACTIVE state of the port** (updated 2026-07-25, up through
-`port_progress.md` Fase 94). For the full phase-by-phase history of every bug found/fixed and every
+**This file describes the CURRENT, ACTIVE state of the port** (updated 2026-07-26, up through
+`port_progress.md` Fase 98). For the full phase-by-phase history of every bug found/fixed and every
 build variant tried, `port_progress.md` is authoritative — this file is an orientation map, not a
 replacement for it.
 
@@ -71,7 +71,7 @@ Layout:
   of historical interest now that the ideas in them have been tried (see `port_progress.md` for
   results).
 
-## Where things stand (as of Fase 94)
+## Where things stand (as of Fase 98)
 
 The port is playable end-to-end: boots, renders, takes touch input, plays audio, saves/loads, at a
 **confirmed real ceiling of ~24 FPS for any 100%-CPU rendering approach** (`--skip-blit-test` measured
@@ -92,12 +92,67 @@ power-cycle): once with `DISABLE_VSYNC+GPU_QUADS` together (never combine these 
 lead (real vitaGL source, fetched from GitHub, pins the exact NULL-pointer mechanism — still needs a
 crash-safe way to confirm which texture is actually bound at the crash moment).
 
+**`build.sh` now hard-guards against `DISABLE_VSYNC=ON`+`GPU_QUADS=ON` (Fase 95)** — `--gpu-quads-pure-test`
+silently carried this exact hang-risk combination since its introduction (its own name suggested a
+"safe" isolated variant, which it was not); a fresh test session ran it, didn't hit the hang this time,
+and read that as evidence GPU_QUADS was becoming safer — it wasn't, it was the same risk from Fase 81
+recurring undetected. Fixed (`--gpu-quads-pure-test` no longer sets `DISABLE_VSYNC`) and hardened: the
+script now scans its own `CMAKE_EXTRA_ARGS` for this combination on every invocation and refuses to build
+(`exit 1`) unless `I_ACCEPT_CONSOLE_HANG_RISK=1` is set — this catches the combination even in variants
+not yet written, not just the two currently known to produce it. **Any previously-built
+`build/zenonia_4_gpu_quads_pure_test.vpk` predates this fix and must be rebuilt before further testing —
+do not reuse it.** Separately, GPU_QUADS's "textures erased / untextured triangles at sprite positions
+after a stage change" symptom (reported same session) is a real, still-undiagnosed bug independent of the
+hang risk — the stage-transition cache invalidation (`gpu_quads_invalidate_cache()`, Fase 69) is confirmed
+correctly wired, so the bug is elsewhere in the mass-delete-then-redecode window. See `port_progress.md`
+Fase 95.
+
+**Open question, unresolved (Fase 98)**: a session with the corrected (`DISABLE_VSYNC=OFF`)
+`--gpu-quads-pure-test` produced a log that cuts off abruptly right after a "frame pesado: quads=16384"
+dump — the same profile that preceded the deterministic `PC=0x0` crash in Fase 72-91 — with no clean-exit
+banner and no next periodic checkpoint. It's unconfirmed whether this was a real crash/hang (which would
+mean the crash mechanism survives even with VSync restored — new information) or just a log pulled
+mid-session (`game_log()` only fully flushes on clean exit — see `port_progress.md`'s log-flush gotcha).
+The session ended before the user could confirm which. **Ask this again before drawing conclusions either
+way** if GPU_QUADS work resumes.
+
 Recent work (Fase 83-94, all CPU-side, GPU_QUADS-independent) chased the ~24 FPS ceiling with several
 optimizations, all gated behind their own `option()`/build.sh flag, all requiring `SPRITE_DECODE_OPTIMIZE`
 except where noted: `SPRITE_DECODE_EX_ALPHA` (native text-blend RLE variant, `--sprite-decode-exalpha-test`,
 less-verified), `SPRITE_DECODE_CACHE` (CPU decode cache for repeat sprites, `--sprite-decode-cache-test`,
 **the one candidate that changes the approach — avoids redundant work instead of just speeding up the
-same work — still pending a real combat-session measurement of its hit rate**), `TEXT_NATIVE_OPTIMIZE`
+same work**; measured a real 0% hit rate in combat (Fase 95) traced to a genuine bug, not a lack of
+repeat content — `sc_decode_and_populate`'s row-boundary tracking (`sprite_decode.c`) over-advanced by a
+full row whenever a row happened to be exactly full (the common case, not the exception, for opaque
+rectangular sprites/tiles), pushing its accounting past capacity and silently discarding almost every
+real sprite from the cache; fixed Fase 96 — but that fix immediately exposed a **second** real bug in the
+same function (consecutive fully-blank rows lost a row of tracking silently, corrupting pixels instead of
+invalidating — visible for the first time on hardware precisely because Fase 96 let the cache start
+storing/replaying entries at all), fixed Fase 97 with an explicit per-row counter matching the real
+decoder's unconditional `dest += stride` semantics exactly. Fase 97's fix raised the real hit rate to
+~99% (162-422 hits/frame vs ~1 miss/frame) — which immediately exposed a **third** real bug, structural
+this time: `sc_hash`/`sc_find` (`sprite_decode.c`) never included the palette pointer (`pal`) in the
+cache key, unlike its twin mechanism `gq_hash` in `gpu_quads.c` (which does, and measures correct high
+hit rates in production). Since pixel color depends on `pal[*p_src]` not just `src`, a cache hit replayed
+whichever palette first populated an entry regardless of which palette a later draw actually requested —
+invisible while the real hit rate was ~0% (Fase 95), but constant visible color corruption ("errores
+graficos que hacen injugable el port") once Fase 97 let hits actually happen at scale. Fixed Fase 99 by
+adding `pal` to `sc_entry`/the hash/the key comparison, mirroring `gq_hash` exactly. That fix in turn
+surfaced a **fourth** issue (Fase 100): the ONLY real invalidation signal for this cache
+(`sprite_cache_invalidate()`, `java.c`) fires on `status==19`, but `g_ui_status` starts at `-1` and
+stays there until the engine's first real `OnUIStatusChange` — meaning the entire Gamevil splash/logo
+phase runs with zero invalidation checkpoints, the worst case for this cache's weak fingerprint
+(pointer + 4 sampled bytes + w/h/pal) against a logo animation that likely redecodes new content at a
+stable heap address every frame. Reported as "broken/white/black textures from the Gamevil title,
+worse than the default build" (the ONLY code difference between default and `--sprite-decode-cache-test`
+is this cache, confirmed via `build.sh` diff). Mitigated (not root-cause-confirmed) Fase 100 by
+skipping the cache entirely while `g_ui_status == -1` (falls back to the existing no-cache decode
+path, zero cost elsewhere, zero benefit lost since that screen is seen once for a few seconds anyway).
+**Still pending hardware confirmation that this actually resolves it — four real interventions in a
+row in this exact mechanism (Fase 95, 96/97, 99, 100) is reason for skepticism, not confidence, that a
+fifth doesn't remain. If this doesn't resolve the reported corruption, reconsider whether
+`SPRITE_DECODE_CACHE` is worth continuing to harden given the ~24 FPS ceiling already limits its
+upside regardless.**), `TEXT_NATIVE_OPTIMIZE`
 (native text blend, `--text-native-optimize-test`, low expected impact — text is called only ~10-18
 times/frame). Recompiling the same algorithm in modern ARMv7 C (vs. the original ARMv5) has NOT shown a
 measurable FPS gain anywhere it's been tried (sprites, confirmed Fase 85) — the bottleneck is memory-
