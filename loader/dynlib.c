@@ -34,6 +34,14 @@ extern volatile int g_ui_status;
 // principal (main.c) lo lee y resetea a 0 despues de cada NativeRender().
 volatile unsigned int g_rgb565_uploads_this_frame = 0;
 
+// Fase 125 (port_progress.md): microsegundos PRESUPUESTADOS dentro de
+// glTexSubImage2D_wrapper (subida real a vitaGL, el candidato a solapar con
+// el siguiente NativeRender en otro hilo). main.c lo acumula y resetea igual
+// que g_rgb565_uploads_this_frame. Solo mide con
+// ZENONIA_INSTRUMENT_UPLOAD_PHASES (2 timestamps por upload, ~1 upload/frame,
+// overhead despreciable, pero instrumentacion al fin).
+SceUInt64 g_upload_us_this_frame = 0;
+
 // Fase 36 (port_progress.md), optimization_ideas.md #2: filas realmente
 // subidas vs. filas que se hubieran subido sin el diffing de
 // DIRTY_RECT_UPLOAD (ver upload_rgb565_dirty_rect mas abajo) -- 0/0 siempre
@@ -148,11 +156,23 @@ static void GVUIPlayerController_callback2_hook(void *param_1) {
 // se construye el singleton, a diferencia del enfoque de
 // GVUIPlayerController (que fallo dos veces por problemas de timing de
 // construccion).
-static so_hook g_touch_keypad_draw_hook;
-static void CZnTouchKeypad_Draw_noop(void) {
-    (void) g_touch_keypad_draw_hook; // referenciado solo para conservar el hook instalado
-}
 #endif
+
+// Fase 129/130: botones en pantalla alternables en runtime (R+L o el menu START+SELECT,
+// config.h cfg_vbuttons_opacity). Oculto = `bx lr` en la entrada de CZnTouchKeypad::Draw
+// (Thumb, 1ra instr `push {r4,lr}`, 2 bytes); visible = bytes originales. Se escribe SOLO al
+// alternar -- la version Fase 129 hacia unhook/rehook (syscalls kubridge) en cada frame.
+// El touch de la cruceta sigue andando oculto (CheckTouchKeyPad no pasa por Draw).
+#include <kubridge.h>
+#include "config.h"
+static uint16_t *g_keypad_draw_entry;
+static uint16_t g_keypad_draw_orig;
+void zenonia_set_vbuttons_visible(int visible) {
+    if (!g_keypad_draw_entry) return;
+    uint16_t ins = visible ? g_keypad_draw_orig : 0x4770; // bx lr
+    kuKernelCpuUnrestrictedMemcpy(g_keypad_draw_entry, &ins, sizeof(ins));
+    kuKernelFlushCaches(g_keypad_draw_entry, sizeof(ins));
+}
 
 // Llamar DESPUES de so_relocate/so_resolve (necesita el modulo ya con
 // dynsym/dynstr resueltos, ver so_symbol()) y ANTES de la primera llamada a
@@ -168,17 +188,16 @@ void zenonia_install_hide_dpad_hook(so_module *mod) {
     so_flush_caches(mod);
     game_log("[HideDpad] hook instalado en GVUIPlayerController::CallBack2 (0x%08x)\n", (unsigned int) cb2_addr);
 
+#endif
     uintptr_t keypad_draw_addr = so_symbol(mod, "_ZN14CZnTouchKeypad4DrawEv");
     if (!keypad_draw_addr) {
-        game_log("[HideDpad] simbolo _ZN14CZnTouchKeypad4DrawEv no encontrado -- cruceta/botones de juego NO se ocultan\n");
+        game_log("[VButtons] simbolo _ZN14CZnTouchKeypad4DrawEv no encontrado -- R+L sin efecto\n");
         return;
     }
-    g_touch_keypad_draw_hook = hook_addr(keypad_draw_addr, (uintptr_t) CZnTouchKeypad_Draw_noop);
-    so_flush_caches(mod);
-    game_log("[HideDpad] hook instalado en CZnTouchKeypad::Draw (0x%08x) -- no-op permanente\n", (unsigned int) keypad_draw_addr);
-#else
-    (void) mod;
-#endif
+    g_keypad_draw_entry = (uint16_t *) (keypad_draw_addr & ~1);
+    g_keypad_draw_orig = *g_keypad_draw_entry;
+    zenonia_set_vbuttons_visible(cfg_vbuttons_opacity > 0);
+    game_log("[VButtons] CZnTouchKeypad::Draw en 0x%08x (instr 0x%04x), visibles=%d\n", (unsigned int) keypad_draw_addr, g_keypad_draw_orig, cfg_vbuttons_opacity > 0);
 }
 
 // --- DrawNative() call-count probe (Fase 29, diagnostico, ver CMakeLists.txt
@@ -1581,6 +1600,22 @@ static void gpu_quads_restore_engine_state(void) {
 }
 #endif
 
+#ifdef ZENONIA_FB_TEX_RING
+#ifdef ZENONIA_GPU_QUADS
+#error "FB_TEX_RING remapea la textura del motor; gpu_quads_restore_engine_state la bindea directo"
+#endif
+// Fase 126: glTexSubImage2D sobre una textura usada hace <=4 frames dispara el
+// copy-on-write de vitaGL (textures.c:983: alloc + memcpy de TODA la textura,
+// glInit la crea cuadrada ~2MB, + free) en cada frame -- era el grueso de los
+// ~17ms de upload medidos en Fase 125. En vez de eso: 3 texturas rotando,
+// escritas directo con vglGetTexDataPointer (solo 1 memcpy, la del frame).
+// ponytail: 3 = en pantalla + en GPU + la que se escribe; si aparece tearing
+// o basura en el FB, subir FB_RING_N (FRAME_PURGE_FREQ=4 es la cota segura).
+#define FB_RING_N 3
+static GLuint g_fb_tex = 0, g_fb_ring[FB_RING_N];
+static int g_fb_ring_cur = 0, g_fb_tex_w = 0;
+#endif
+
 // El motor sube su framebuffer interno de software (400x240, ver Fase 1 del
 // plan) en RGB565 -- vitaGL no lo maneja igual que el motor original espera,
 // asi que se convierte a RGBA8888 en CPU antes de subirlo. Mismo bug
@@ -1648,6 +1683,24 @@ void glTexImage2D_wrapper(GLenum target, GLint level, GLint internalformat, GLsi
     glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+#ifdef ZENONIA_FB_TEX_RING
+    // glInit (out_ghidra.c) crea el FB una sola vez: CLAMP_TO_EDGE + filtro forzado a LINEAR arriba.
+    if (!g_fb_tex && format == GL_RGB && type == GL_UNSIGNED_SHORT_5_6_5) {
+        g_fb_tex = g_fb_ring[0] = g_engine_bound_tex;
+        g_fb_tex_w = width;
+        glGenTextures(FB_RING_N - 1, &g_fb_ring[1]);
+        for (int i = 1; i < FB_RING_N; i++) {
+            glBindTexture(target, g_fb_ring[i]);
+            glTexImage2D(target, level, internalformat, width, height, border, format, type, pixels);
+            glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        glBindTexture(target, g_fb_tex);
+        game_log("[FbRing] %d texturas %dx%d (tex motor=%u)\n", FB_RING_N, width, height, g_fb_tex);
+    }
+#endif
 }
 
 void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels) {
@@ -1668,6 +1721,10 @@ void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yo
     if (g_frameskip_is_skip_frame) {
         return;
     }
+#endif
+
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+    SceUInt64 up_t0 = sceKernelGetProcessTimeWide();
 #endif
 
     static int subimg_log = 0;
@@ -1699,6 +1756,17 @@ void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yo
         glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
     }
 #else
+#ifdef ZENONIA_FB_TEX_RING
+    if (g_fb_tex && g_engine_bound_tex == g_fb_tex && type == GL_UNSIGNED_SHORT_5_6_5 && pixels) {
+        g_fb_ring_cur = (g_fb_ring_cur + 1) % FB_RING_N;
+        glBindTexture(target, g_fb_ring[g_fb_ring_cur]);
+        const int stride = ((g_fb_tex_w + 7) & ~7) * 2; // vitaGL: VGL_ALIGN(w, 8) * bpp
+        uint8_t *dst = (uint8_t *)vglGetTexDataPointer(target) + yoffset * stride + xoffset * 2;
+        const uint8_t *src = (const uint8_t *)pixels;
+        for (int y = 0; y < height; y++)
+            memcpy(dst + y * stride, src + y * width * 2, width * 2);
+    } else
+#endif
     glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
 #endif
 #else
@@ -1708,6 +1776,10 @@ void glTexSubImage2D_wrapper(GLenum target, GLint level, GLint xoffset, GLint yo
     } else {
         glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
     }
+#endif
+
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+    g_upload_us_this_frame += sceKernelGetProcessTimeWide() - up_t0;
 #endif
 
 }
@@ -1986,6 +2058,10 @@ void glDisable_wrapper(GLenum cap) {
 // es la del FB base (la que recibe subidas RGB565).
 void glBindTexture_wrapper(GLenum target, GLuint texture) {
     if (target == GL_TEXTURE_2D) g_engine_bound_tex = texture;
+#ifdef ZENONIA_FB_TEX_RING
+    // El motor siempre bindea su id original; se dibuja la ultima copia escrita del anillo.
+    if (target == GL_TEXTURE_2D && g_fb_tex && texture == g_fb_tex) texture = g_fb_ring[g_fb_ring_cur];
+#endif
     glBindTexture(target, texture);
 }
 

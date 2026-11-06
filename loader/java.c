@@ -648,8 +648,14 @@ jint Zenonia_getGLOptionLinear(jmethodID id, va_list args) {
     return 1; // 1 = filtrado lineal
 }
 
+// FPS objetivo del motor (NexusGLThread.SetFPS en el APK: el hilo GL de Android
+// dormia hasta 1000/speed ms por frame). Medido: 21 en menus, 23 en gameplay.
+// main.c ritma el loop con esto -- la logica avanza 1 tick por NativeRender.
+volatile int g_engine_fps = 21;
+
 void Zenonia_SetSpeed(jmethodID id, va_list args) {
     int speed = va_arg(args, int);
+    if (speed > 0) g_engine_fps = speed;
     game_log("[Java] SetSpeed: %d\n", speed);
 }
 

@@ -98,9 +98,13 @@ All optimization variants tested and documented in `port_progress.md`:
 | **Triangle (△)** | Skip dialogue / Cutscene |
 | **Square (□)** | Open World Map |
 | **L-Trigger** | Quick Save Game |
-| **R-Trigger + SELECT** | **Cycle FrameSkip Speed (1.0x ➔ 1.5x ➔ 2.0x ➔ 2.5x ➔ 3.0x)** |
-| **START + SELECT** | Exit Game safely to LiveArea |
+| **START + SELECT** | PS Vita options menu: button remapping, FPS, on-screen buttons (game pauses) |
+| **R + SELECT** | Frame skip: **AUTO** (default) / OFF |
+| **L + SELECT** | FPS: **23** (default, original game speed) / 30 (faster, Zenonia 2/3 style) |
+| **R + L** | Show / hide the on-screen buttons (default: shown; hidden buttons still respond to touch) |
 | **Front Touchscreen** | Full native touch controls & UI navigation |
+
+Settings are saved to `ux0:data/zenonia-4/config.txt` and `controls.txt` (editable by hand). To quit, use the PS button.
 
 ---
 

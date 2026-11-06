@@ -1,61 +1,42 @@
-# Zenonia 4 PS Vita Port v1.0.0 — Turbo Release (Multi-Tier FrameSkip & No-Logs Max Performance)
+# Zenonia 4 PS Vita Port v1.1.0 — Original Game Speed, Options Menu & Remapping
 
-**Release Tag:** `v1.0.0-turbo`
-
----
-
-## ⚔️ Zenonia 4 — PlayStation Vita Port (v1.0.0 Turbo Edition)
-
-First official release of the native **Zenonia 4 (Android)** port for the **PlayStation Vita**, featuring **intelligent multi-tier FrameSkip**, **direct RGB565 hardware rendering**, **RAM audio caching**, and **maximum CPU optimization**.
+**Release Tag:** `1.1.0`
 
 ---
 
-## 🚀 What's New in v1.0.0 Turbo
+## 🚀 What's New in v1.1.0
 
-- **⚡ Multi-Tier FrameSkip (1.0x to 3.0x)**:
-  - Dynamic frame pacing allowing you to adjust game speed in real-time between **1.0x (Normal)**, **1.5x**, **2.0x (Default)**, **2.5x**, and **3.0x (Max)**.
-  - Game logic, physics, enemy AI, and touch/pad inputs run at a full **60 Hz tick rate** while rendering load is cut down, yielding a super-smooth 20–30+ FPS experience.
-  - Frame pacing is active across gameplay, Title screen animations, and Main Menus.
-- **🖥️ On-Screen OSD HUD Notification**:
-  - Displays a clean, translucent banner at the top of the screen when changing speed modes (`FRAME SKIP: 2.0X`, etc.) with smooth fade-out.
-- **🛡️ 100% Authentic Visuals & UI Bug Fixes**:
-  - Off-screen text and button caches (`p9 != 0`) are fully preserved, fixing missing text labels on pause/inventory popups (*Destroy*, *Repair*, *Equip*, *Discard*).
-  - Redundant 1.04 MB `FastClearNonClipping` writes are bypassed on skipped frames to drastically reduce RAM bandwidth usage.
-- **🔇 Zero-Log Max CPU Performance**:
-  - Release binaries are built with file logging disabled (`ENABLE_LOGGING=OFF`), eliminating SD card / SD2Vita write latency and format-string overhead during gameplay.
-- **🎵 Multi-Core Thread Affinity**:
-  - Main game loop pinned to **CPU Core 0** at 444 MHz.
-  - Audio mixing and background OGG playback isolated to **CPU Core 1** with zero SD card access (audio cached in RAM).
+- **⏱️ Correct game speed.** Zenonia 4 was designed to run at **21 FPS in menus and 23 FPS in gameplay** (the Android game asks for it itself). Earlier builds ignored that, so menus ran too fast, combat ran in slow motion and the fixed frame-skip patterns made characters stutter while walking. The game now always runs at its original speed.
+- **🎞️ AUTO frame skip (default).** It skips drawing a frame only when the game falls behind, so movement speed stays constant even in heavy fights. OFF draws every frame, but the game slows down in heavy scenes.
+- **⚡ Optional 30 FPS mode** (Zenonia 2/3 style): the whole game runs about 1.3x faster.
+- **🎮 PS Vita options menu (START + SELECT)**, ported from the Zenonia 3 port: remap every action, change FPS, show or hide the on-screen buttons. The game pauses while it's open.
+- **👆 Hide the on-screen buttons (R + L).** They still respond to touch, and the game runs noticeably faster with them hidden.
+- **🕹️ Left stick moves**, and input no longer lags or gets stuck (all queued button events are now handled every frame).
+- **🖼️ Faster framebuffer upload.** Down from ~17 ms to ~1.6 ms per frame (3-texture ring instead of vitaGL's copy-on-write).
 
----
+## ⚙️ Defaults
 
-## 🎮 Controls
+| Setting | Default | Change with |
+| :--- | :--- | :--- |
+| Frame skip | **AUTO** | R + SELECT (AUTO / OFF) |
+| FPS | **23** (original speed) | L + SELECT (23 / 30) |
+| On-screen buttons | **Shown** | R + L |
+| Button layout | Cross = Attack/OK, Circle = Back, Triangle = Skip, Square = Map, L = Save | START + SELECT |
 
-| Button / Input | Action |
-| :--- | :--- |
-| **D-Pad / Left Stick** | Move character / Navigate menus |
-| **Cross (✕)** | Attack / Confirm / Interact |
-| **Circle (◯)** | Back / Cancel |
-| **Triangle (△)** | Skip dialogue / Cutscene |
-| **Square (□)** | Open World Map |
-| **L-Trigger** | Quick Save Game |
-| **R-Trigger + SELECT** | **Cycle FrameSkip Speed (1.0x ➔ 1.5x ➔ 2.0x ➔ 2.5x ➔ 3.0x)** |
-| **START + SELECT** | Exit Game safely |
-| **Front Touchscreen** | Full native touch controls & menu navigation |
+On-screen messages only appear when you change a setting. Settings are saved in `ux0:data/zenonia-4/config.txt` and `controls.txt`.
 
----
+## ⚠️ Known Limitations
 
-## 📦 Installation Instructions
+- **Heavy combat shows ~10–12 frames per second while the game logic stays at the full 23** (with AUTO, hidden buttons give 10–14). The original engine draws everything in software on a single CPU thread, and one drawn frame costs ~70 ms on the Vita.
+- **START + SELECT no longer exits the game** — use the PS button.
 
-1. Install `zenonia_4_turbo_nologs.vpk` on your PlayStation Vita via **VitaShell**.
-2. Extract the game asset files from the Android APK (`assets/` and `lib/armeabi/libgameDSO.so`) into `ux0:data/zenonia-4/`.
-3. Ensure `ux0:data/zenonia-4/libgameDSO.so` and `ux0:data/zenonia-4/assets/` are present.
-4. Launch **Zenonia 4** from LiveArea and enjoy the game!
+## 📦 Installation
 
----
+1. Install `zenonia_4_pace_nologs.vpk` with **VitaShell**.
+2. Copy `libgameDSO.so` (from the APK's `lib/armeabi/`) and the APK's `assets/` folder into `ux0:data/zenonia-4/`.
+3. Launch **Zenonia 4** from LiveArea.
 
-## 📁 Downloads / Assets
+## 📁 Downloads
 
-- **`zenonia_4_turbo_nologs.vpk`** *(Recommended)*: Maximum CPU speed, zero SD card I/O.
-- **`zenonia_4_turbo.vpk`**: Turbo variant with active telemetry/debug logging.
-- **`zenonia_4.vpk`**: Standard build with Multi-Tier FrameSkip.
+- **`zenonia_4_pace_nologs.vpk`** *(recommended)*: no logging, no SD card writes.
+- **`zenonia_4_pace.vpk`**: same build with logging to `ux0:data/zenonia-4/logs/log_NNNN.log` (for bug reports).

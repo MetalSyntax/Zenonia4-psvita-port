@@ -10,6 +10,31 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(zenonia_4)
+
+## vitaGL vendorizada: arbol de Dungeon-Hunter-2-vita (2026 master + mods de
+## compat, egl.c restaurado) + autodeteccion system_app deshabilitada.
+## Flags = set BASE de DH2, probado en esta consola (SOFTFP_ABI=1 incluido).
+## vitashark del sistema, igual que DH2.
+set(VITAGL_VENDOR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/vitaGL)
+set(VITAGL_MAKE_FLAGS_STR "SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=2")
+# Fase 125: flags extra de vitaGL desde la linea de cmake (p.ej. el set de
+# hacks probado en --turbo-hacks-test). Separado para que el default no cambie.
+set(VITAGL_EXTRA_FLAGS "" CACHE STRING "Extra vitaGL make flags (space-separated, e.g. MATH_SPEEDHACK=1)")
+separate_arguments(VITAGL_MAKE_FLAGS UNIX_COMMAND "${VITAGL_MAKE_FLAGS_STR} ${VITAGL_EXTRA_FLAGS}")
+include(ExternalProject)
+ExternalProject_Add(
+  vitaGL_vendored
+  SOURCE_DIR ${VITAGL_VENDOR_DIR}
+  BUILD_IN_SOURCE 1
+  CONFIGURE_COMMAND ""
+  BUILD_COMMAND make ${VITAGL_MAKE_FLAGS}
+  INSTALL_COMMAND ""
+)
+add_library(vitaGL_vendored_lib STATIC IMPORTED)
+set_target_properties(vitaGL_vendored_lib PROPERTIES IMPORTED_LOCATION ${VITAGL_VENDOR_DIR}/libvitaGL.a)
+add_dependencies(vitaGL_vendored_lib vitaGL_vendored)
+include_directories(${VITAGL_VENDOR_DIR}/source)
+
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 ## Configuracion de la app
@@ -59,6 +84,14 @@ endif()
 ## Frame Skip: salta el renderizado de sprites y subida de 1MB a vitaGL en frames
 ## impares durante el gameplay (ui_status == 14), acelerando la velocidad de juego
 ## al doble en CPU pura, con 60 Hz de actualizacion de logica/inputs.
+## Fase 126: anillo de 3 texturas para el FB del motor, escritas directo con
+## vglGetTexDataPointer -- evita el copy-on-write de vitaGL (alloc+memcpy de la
+## textura entera ~2MB por frame). Incompatible con GPU_QUADS (#error en dynlib.c).
+option(FB_TEX_RING "Rotate 3 framebuffer textures written directly (skips vitaGL copy-on-write in glTexSubImage2D)" OFF)
+if (FB_TEX_RING)
+  add_definitions(-DZENONIA_FB_TEX_RING=1)
+endif()
+
 option(ENABLE_FRAMESKIP "Enable intelligent frame skip on gameplay frames for smooth 20+ FPS on CPU" ON)
 if (ENABLE_FRAMESKIP)
   add_definitions(-DZENONIA_FRAMESKIP=1)
@@ -172,6 +205,16 @@ endif()
 option(INSTRUMENT_FRAME_PHASES "Measure wall-clock time spent in handleCletEvent / NativeRender / everything else, once per frame via sceKernelGetProcessTimeWide (diagnostic, negligible overhead -- unlike other INSTRUMENT_* flags this one IS safe to judge relative timing from)" OFF)
 if (INSTRUMENT_FRAME_PHASES)
   add_definitions(-DZENONIA_INSTRUMENT_FRAME_PHASES=1)
+endif()
+
+## Fase 125 (port_progress.md): separa el costo del present (upload RGB565 de
+## 1MB via glTexSubImage2D + swap/vblank) del "resto" de INSTRUMENT_FRAME_PHASES
+## -- decide si un pipeline en 2 hilos (engine || upload/present) vale la pena.
+## Mismo costo insignificante (timestamps por upload y por swap, no por llamada
+## del motor), misma seguridad para juzgar tiempos relativos.
+option(INSTRUMENT_UPLOAD_PHASES "Measure wall-clock time spent in the framebuffer upload and in vglSwapBuffers per frame (diagnostic, negligible overhead -- decides whether a 2-thread upload pipeline is worth building)" OFF)
+if (INSTRUMENT_UPLOAD_PHASES)
+  add_definitions(-DZENONIA_INSTRUMENT_UPLOAD_PHASES=1)
 endif()
 
 ## Fase 86 (port_progress.md): --frame-phases-probe (arriba) mostro que la
@@ -409,6 +452,8 @@ add_executable(${PROJECT_NAME}
   ./loader/audio.c
   ./loader/neon_mem.c
   ./loader/font.c
+  ./loader/config.c
+  ./loader/vitamenu.c
   ./loader/htmltext.c
   ./loader/htmlview.c
   ./loader/androidui.c
@@ -419,7 +464,7 @@ add_executable(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME}
-  vitaGL
+  vitaGL_vendored_lib
   vitashark
   mathneon
   m

@@ -347,7 +347,7 @@ def download_latest_debug_files():
                 ftp.retrbinary(f"RETR {latest_log}", f.write)
             print(f"[+] Descargado '{latest_log}' en la carpeta logs/.")
         else:
-            print("[-] No se encontraron archivos de registro (.txt) en ux0:/data/zenonia4/logs.")
+            print("[-] No se encontraron archivos de registro (.log) en ux0:/data/zenonia4/logs.")
     except all_errors as e:
         print(f"[-] Error al buscar o descargar logs: {e}")
     finally:
@@ -674,7 +674,7 @@ def main():
     options = [
         ("Subir VPK compilado a la PS Vita (ux0:downloads/)", upload_vpk),
         ("Subir SOLO el eboot.bin a la PS Vita (ux0:app/PSVZ00004/)", upload_eboot),
-        ("Descargar el último dump (.dmp) y log (.txt) de Zenonia 4", download_latest_debug_files),
+        ("Descargar el último dump (.dmp) y log (.log) de Zenonia 4", download_latest_debug_files),
         ("Desconectar Proton VPN ahora mismo", disconnect_proton_vpn),
         ("Ejecutar clean_macos.sh (build/)", lambda: run_script("build", "clean_macos.sh")),
         ("Ejecutar build_and_install.sh (build/)", lambda: run_script("build", "build_and_install.sh")),

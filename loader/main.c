@@ -14,6 +14,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/cpu.h>
 #include <psp2/io/dirent.h>
+#include <psp2/io/stat.h>
 #include <psp2/ctrl.h>
 #include <psp2/touch.h>
 #include <psp2/display.h>
@@ -36,6 +37,8 @@ void invoke_splashscreen(void) {}
 #ifdef ZENONIA_GPU_QUADS
 #include "gpu_quads.h"
 #endif
+#include "config.h"
+#include "vitamenu.h"
 #include <taihen.h>
 #include <vitaGL.h>
 #include <falso_jni/FalsoJNI.h>
@@ -45,14 +48,13 @@ void invoke_splashscreen(void) {}
 
 #ifdef ZENONIA_FRAMESKIP
 enum {
-    FRAMESKIP_OFF  = 0, // 1.0x (Sin salto)
-    FRAMESKIP_1_5X = 1, // 1.5x (Salta 1 de cada 3 frames)
-    FRAMESKIP_2_0X = 2, // 2.0x (Salta 1 de cada 2 frames)
-    FRAMESKIP_2_5X = 3, // 2.5x (Salta 3 de cada 5 frames)
-    FRAMESKIP_3_0X = 4, // 3.0x (Salta 2 de cada 3 frames)
-    FRAMESKIP_COUNT = 5
+    FRAMESKIP_AUTO = 0, // Salta solo cuando el loop va atrasado respecto a g_engine_fps
+    FRAMESKIP_OFF  = 1, // Sin salto (Fase 130: los patrones fijos 1.5x-3x se quitaron, cambiaban la velocidad del juego)
+    FRAMESKIP_COUNT = 2
 };
-volatile int g_frameskip_mode = FRAMESKIP_2_0X; // Default: 2.0x
+// Tope de frames saltados seguidos en AUTO: garantiza >= 1 frame presentado cada 4 ticks.
+#define FRAMESKIP_AUTO_MAX 3
+volatile int g_frameskip_mode = FRAMESKIP_AUTO;
 volatile int g_frameskip_is_skip_frame = 0;
 #else
 volatile int g_frameskip_mode = 0;
@@ -117,6 +119,8 @@ volatile int g_frameskip_is_skip_frame = 0;
 #endif
 
 FILE *log_file = NULL;
+static unsigned int g_presented_frames = 0;
+
 
 // Una vez que vitaGL toma la pantalla, no se debe seguir escribiendo al
 // framebuffer crudo de debugScreen -- ambos competirian por el mismo buffer.
@@ -132,9 +136,13 @@ unsigned int sceLibcHeapSize = 4 * 1024 * 1024; // 4 MB para SCE Libc (system li
 void init_log() {
     sceIoMkdir(LOG_DIR, 0777); // falla en silencio si ya existe
 
+    // log_0001.log, log_0002.log, ... -- el primer numero libre (orden = orden de corrida).
     char log_path[256];
-    time_t t = time(NULL);
-    snprintf(log_path, sizeof(log_path), LOG_DIR "/log_%u.txt", (unsigned int) t);
+    SceIoStat st;
+    for (unsigned int n = 1; n < 10000; n++) {
+        snprintf(log_path, sizeof(log_path), LOG_DIR "/log_%04u.log", n);
+        if (sceIoGetstat(log_path, &st) < 0) break;
+    }
 
     log_file = fopen(log_path, "w");
     if (log_file) {
@@ -273,18 +281,6 @@ static void queue_input_event(int type, int p1, int p2, int p3) {
     }
 }
 
-static const struct { unsigned int btn; int hal; } btn_map[] = {
-    { SCE_CTRL_UP,       HAL_KEY_UP },
-    { SCE_CTRL_DOWN,     HAL_KEY_DOWN },
-    { SCE_CTRL_LEFT,     HAL_KEY_LEFT },
-    { SCE_CTRL_RIGHT,    HAL_KEY_RIGHT },
-    { SCE_CTRL_CROSS,    HAL_KEY_OK },
-    { SCE_CTRL_CIRCLE,   HAL_KEY_BACK },
-    { SCE_CTRL_TRIANGLE, HAL_KEY_SKIP },
-    { SCE_CTRL_SQUARE,   HAL_KEY_MAP },
-    { SCE_CTRL_LTRIGGER, HAL_KEY_SAVE },
-};
-#define BTN_MAP_COUNT (sizeof(btn_map) / sizeof(btn_map[0]))
 
 // NOTA: a diferencia de Zenonia 2, aca NO se porta ningun parche binario
 // (apply_so_patches). El bug de Zenonia2 (puntero de heap tratado como
@@ -296,6 +292,7 @@ static const struct { unsigned int btn; int hal; } btn_map[] = {
 
 extern volatile int g_ui_status;
 extern volatile unsigned int g_rgb565_uploads_this_frame;
+extern SceUInt64 g_upload_us_this_frame;
 extern volatile unsigned int g_drawnative_calls_this_frame;
 extern volatile unsigned int g_cgxpzxani_draw_calls_this_frame;
 extern volatile unsigned int g_cgxpzxzero_blt_calls_this_frame;
@@ -316,6 +313,7 @@ extern volatile unsigned int g_sprite_cache_misses_this_frame;
 extern void zenonia_install_text_calls_probe(so_module *mod);
 extern void zenonia_install_array_hooks(void);
 extern void zenonia_install_hide_dpad_hook(so_module *mod);
+extern void zenonia_set_vbuttons_visible(int visible);
 extern void zenonia_install_drawnative_probe(so_module *mod);
 extern void zenonia_install_hotpath_probe(so_module *mod);
 #ifdef ZENONIA_GPU_QUADS
@@ -470,6 +468,8 @@ void gl_init() {
 
 int main() {
     init_log();
+    config_load();
+    config_save(); // escribe config.txt/controls.txt completos para editarlos a mano
 	game_log("Iniciando Zenonia 4 port (SoLoader)\n");
 #ifdef ZENONIA_BUILD_VARIANT
 	// Fase 85 (port_progress.md): identifica el build variant en la
@@ -605,6 +605,7 @@ int main() {
 #endif
 
 		sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+		sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG); // stick izquierdo = cruceta (como Zenonia 3)
 
 		SceCtrlData pad;
 		SceTouchData touch;
@@ -614,6 +615,11 @@ int main() {
 		unsigned int old_buttons = 0;
 		int frame = 0;
 		unsigned int rgb565_upload_accum = 0;
+		// Fase 125: us acumulados en upload (wrapper) y swap, para decidir si
+		// un pipeline en 2 hilos vale la pena. 0.0 siempre sin
+		// ZENONIA_INSTRUMENT_UPLOAD_PHASES.
+		SceUInt64 upload_us_accum = 0;
+		SceUInt64 swap_us_accum = 0;
 		unsigned int drawnative_calls_accum = 0;
 		unsigned int cgxpzxani_draw_calls_accum = 0;
 		unsigned int cgxpzxzero_blt_calls_accum = 0;
@@ -648,9 +654,6 @@ int main() {
 		SceUInt64 frame_phase_rest_accum_us = 0;
 #endif
 
-#ifdef ZENONIA_FRAMESKIP
-		osd_show_message("FRAME SKIP: 2.0X (R+SELECT)", 150);
-#endif
 
 		while (1) {
 			sceCtrlPeekBufferPositive(0, &pad, 1);
@@ -665,11 +668,15 @@ int main() {
 				// insignificante.
 				static SceUInt64 last_fps_tick = 0;
 				SceUInt64 now = sceKernelGetProcessTimeWide();
-				float fps = 0.0f;
+				float fps = 0.0f, shown_fps = 0.0f;
 				if (last_fps_tick != 0 && now > last_fps_tick) {
 					fps = 120.0f / ((now - last_fps_tick) / 1000000.0f);
+					shown_fps = g_presented_frames / ((now - last_fps_tick) / 1000000.0f);
 				}
 				last_fps_tick = now;
+				// fps = ticks de logica/s (velocidad del juego); shown = frames realmente presentados/s.
+				{ extern volatile int g_engine_fps; game_log("[Pace] target=%d game_speed=%d ticks_fps=%.1f shown_fps=%.1f skip_mode=%d\n", cfg_fps == 30 ? 30 : g_engine_fps, g_engine_fps, fps, shown_fps, g_frameskip_mode); }
+				g_presented_frames = 0;
 				// Fase 27: promedio de subidas del framebuffer RGB565 por
 				// frame en los ultimos 120 frames -- confirma o descarta si
 				// el motor sube el mismo framebuffer completo mas de una vez
@@ -769,9 +776,20 @@ int main() {
 					frame_phase_cletevent_accum_us / 120.0f / 1000.0f,
 					frame_phase_nativerender_accum_us / 120.0f / 1000.0f,
 					frame_phase_rest_accum_us / 120.0f / 1000.0f);
-				frame_phase_cletevent_accum_us = 0;
-				frame_phase_nativerender_accum_us = 0;
-				frame_phase_rest_accum_us = 0;
+			frame_phase_cletevent_accum_us = 0;
+			frame_phase_nativerender_accum_us = 0;
+			frame_phase_rest_accum_us = 0;
+#endif
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+			// Fase 125: costo del present (upload 1MB + swap/vblank) separado
+			// del resto -- decide si un pipeline en 2 hilos (engine ||
+			// upload/present) vale la pena. Linea propia para no romper el
+			// parseo de "frame N alive".
+			game_log("[UploadPhases] avg ms/frame (ultimos 120): upload=%.2f swap=%.2f\n",
+				upload_us_accum / 120.0f / 1000.0f,
+				swap_us_accum / 120.0f / 1000.0f);
+			upload_us_accum = 0;
+			swap_us_accum = 0;
 #endif
 				// Fase 71 (2026-07-23): game_log() no hace fflush por linea (ver
 				// su propio comentario -- eso costaba 10 FPS reales). Efecto
@@ -787,9 +805,6 @@ int main() {
 				if (log_file) fflush(log_file);
 			}
 
-			// Salida de emergencia: START+SELECT juntos
-			if ((pad.buttons & SCE_CTRL_START) && (pad.buttons & SCE_CTRL_SELECT)) break;
-
 			// UI_STATUS_EXIT (104): en Android, ZenoniaUIControllerView.setUIState()
 			// llama NexusGLActivity.myActivity.finishApp() para este estado --
 			// una llamada puramente de Android que este loader no tiene forma
@@ -801,42 +816,81 @@ int main() {
 			if (g_ui_status == UI_STATUS_EXIT) break;
 
 			unsigned int pressed = pad.buttons & ~old_buttons;
-			unsigned int released = old_buttons & ~pad.buttons;
 
-			// ABOUT/HELP (ui_status 5/4): en el APK original el scroll de
-			// aboutWebView/helpWebView era gesto tactil -- sin capa Android
-			// (ver androidui.c) no hay forma de reproducir eso, asi que se
-			// reusa D-pad arriba/abajo para scrollear en vez de reenviarlo al
-			// motor (que de todos modos no hace nada con UP/DOWN en estos 2
-			// estados). Mantenido presionado = scroll continuo.
-			if (g_ui_status == 4 || g_ui_status == 5) {
-				if (pad.buttons & SCE_CTRL_UP)   androidui_scroll_info_text(g_ui_status, -8.0f, SCREEN_W, SCREEN_H);
-				if (pad.buttons & SCE_CTRL_DOWN) androidui_scroll_info_text(g_ui_status,  8.0f, SCREEN_W, SCREEN_H);
-				pressed  &= ~(SCE_CTRL_UP | SCE_CTRL_DOWN);
-				released &= ~(SCE_CTRL_UP | SCE_CTRL_DOWN);
+			// Fase 129 (estilo Zenonia 3): START+SELECT abre/cierra el menu de opciones de Vita
+			// (vitamenu.c: remapeo, FPS, botones en pantalla) -- antes era salida de emergencia.
+			// Botones que siguen apretados al cerrar no llegan al juego hasta soltarlos.
+#define MENU_COMBO (SCE_CTRL_START | SCE_CTRL_SELECT)
+			static uint32_t suppressed = 0;
+			int menu_was_open = vitamenu_active();
+			if ((pad.buttons & MENU_COMBO) == MENU_COMBO && (old_buttons & MENU_COMBO) != MENU_COMBO) {
+				if (menu_was_open) vitamenu_close(); else vitamenu_open();
+			} else if (menu_was_open) {
+				vitamenu_update(pad.buttons, pressed);
+			}
+			if (menu_was_open && !vitamenu_active()) {
+				suppressed = pad.buttons;
+				zenonia_set_vbuttons_visible(cfg_vbuttons_opacity > 0); // el menu pudo cambiarlo
 			}
 
-			for (int i = 0; i < BTN_MAP_COUNT; i++) {
-				if (pressed & btn_map[i].btn)
-					queue_input_event(MH_KEY_PRESSEVENT, btn_map[i].hal, 0, 0);
-				if (released & btn_map[i].btn)
-					queue_input_event(MH_KEY_RELEASEEVENT, btn_map[i].hal, 0, 0);
-			}
-
+			// Atajos fuera del menu: R+SELECT frameskip, L+SELECT FPS 23/30, R+L botones en pantalla.
+			// Los botones del combo no llegan al juego hasta soltarlos (L es Guardar por default).
+#define COMBO_FS       (SCE_CTRL_RTRIGGER | SCE_CTRL_SELECT)
+#define COMBO_FPS      (SCE_CTRL_LTRIGGER | SCE_CTRL_SELECT)
+#define COMBO_VBUTTONS (SCE_CTRL_RTRIGGER | SCE_CTRL_LTRIGGER)
+#define COMBO_HIT(c)   ((pad.buttons & (c)) == (c) && (old_buttons & (c)) != (c))
+			if (!vitamenu_active() && !menu_was_open) {
 #ifdef ZENONIA_FRAMESKIP
-			if (((pressed & SCE_CTRL_SELECT) && (pad.buttons & SCE_CTRL_RTRIGGER)) ||
-			    ((pressed & SCE_CTRL_RTRIGGER) && (pad.buttons & SCE_CTRL_SELECT))) {
-				g_frameskip_mode = (g_frameskip_mode + 1) % FRAMESKIP_COUNT;
-				const char *mode_str = "FRAME SKIP: 1X (OFF)";
-				if (g_frameskip_mode == FRAMESKIP_1_5X) mode_str = "FRAME SKIP: 1.5X";
-				else if (g_frameskip_mode == FRAMESKIP_2_0X) mode_str = "FRAME SKIP: 2.0X";
-				else if (g_frameskip_mode == FRAMESKIP_2_5X) mode_str = "FRAME SKIP: 2.5X";
-				else if (g_frameskip_mode == FRAMESKIP_3_0X) mode_str = "FRAME SKIP: 3.0X (MAX)";
-				
-				osd_show_message(mode_str, 90);
-				game_log("[FrameSkip] Modo cambiado a: %s (mode=%d)\n", mode_str, g_frameskip_mode);
-			}
+				if (COMBO_HIT(COMBO_FS)) {
+					g_frameskip_mode = (g_frameskip_mode + 1) % FRAMESKIP_COUNT;
+					const char *mode_str = g_frameskip_mode == FRAMESKIP_AUTO ? "FRAME SKIP: AUTO" : "FRAME SKIP: OFF";
+					osd_show_message(mode_str, 90);
+					game_log("[FrameSkip] Modo cambiado a: %s (mode=%d)\n", mode_str, g_frameskip_mode);
+				}
 #endif
+				if (COMBO_HIT(COMBO_FPS)) {
+					cfg_fps = cfg_fps == 30 ? 23 : 30;
+					config_save();
+					const char *fps_str = cfg_fps == 30 ? "FPS: 30 (FAST, ZENONIA 2/3 STYLE)" : "FPS: 23 (ORIGINAL SPEED)";
+					osd_show_message(fps_str, 90);
+					game_log("[Pace] Modo cambiado a: %s\n", fps_str);
+				}
+				if (COMBO_HIT(COMBO_VBUTTONS)) {
+					cfg_vbuttons_opacity = cfg_vbuttons_opacity ? 0 : 100;
+					config_save();
+					zenonia_set_vbuttons_visible(cfg_vbuttons_opacity > 0);
+					osd_show_message(cfg_vbuttons_opacity ? "ON-SCREEN BUTTONS: SHOWN" : "ON-SCREEN BUTTONS: HIDDEN", 90);
+				}
+				if ((pad.buttons & SCE_CTRL_SELECT) && (pad.buttons & (SCE_CTRL_RTRIGGER | SCE_CTRL_LTRIGGER)))
+					suppressed |= pad.buttons & (SCE_CTRL_RTRIGGER | SCE_CTRL_LTRIGGER | SCE_CTRL_SELECT);
+				if ((pad.buttons & COMBO_VBUTTONS) == COMBO_VBUTTONS)
+					suppressed |= COMBO_VBUTTONS;
+			}
+			suppressed &= pad.buttons;
+
+			// Flancos del estado de ACCIONES (no de botones crudos): remapeo (controls.txt), stick
+			// izquierdo y abrir el menu salen como press/release normales.
+			static uint32_t old_acts = 0;
+			uint32_t acts = 0;
+			if (!vitamenu_active()) {
+				uint32_t b = pad.buttons & ~suppressed;
+				for (int a = 0; a < ACT_COUNT; a++)
+					if (b & cfg_binds[a]) acts |= 1u << a;
+				if (pad.lx < 64) acts |= 1u << ACT_LEFT; else if (pad.lx > 192) acts |= 1u << ACT_RIGHT;
+				if (pad.ly < 64) acts |= 1u << ACT_UP;   else if (pad.ly > 192) acts |= 1u << ACT_DOWN;
+			}
+			if (g_ui_status == 4 || g_ui_status == 5) {
+				// ABOUT/HELP: arriba/abajo scrollean el texto propio del port en vez de ir al motor.
+				if (acts & (1u << ACT_UP))   androidui_scroll_info_text(g_ui_status, -8.0f, SCREEN_W, SCREEN_H);
+				if (acts & (1u << ACT_DOWN)) androidui_scroll_info_text(g_ui_status,  8.0f, SCREEN_W, SCREEN_H);
+				acts &= ~((1u << ACT_UP) | (1u << ACT_DOWN));
+			}
+			for (int a = 0; a < ACT_COUNT; a++) {
+				uint32_t bit = 1u << a;
+				if ((acts ^ old_acts) & bit)
+					queue_input_event((acts & bit) ? MH_KEY_PRESSEVENT : MH_KEY_RELEASEEVENT, action_hal(a), 0, 0);
+			}
+			old_acts = acts;
 			old_buttons = pad.buttons;
 
 			// Touch: panel 1920x1088 -> espacio de JUEGO (GAME_W x GAME_H =
@@ -847,7 +901,7 @@ int main() {
 			// pantalla. p3 es el pointerId (un solo dedo: 0). El evento 25
 			// (MOVE) se manda cuando el dedo se arrastra -- Android lo manda
 			// en cada ACTION_MOVE; aca, cuando cambia la celda de pixel.
-			if (touch.reportNum > 0) {
+			if (touch.reportNum > 0 && !vitamenu_active()) {
 				int x = touch.report[0].x * GAME_W / 1920;
 				int y = touch.report[0].y * GAME_H / 1088;
 
@@ -965,29 +1019,28 @@ int main() {
 			SceUInt64 fp_frame_start = sceKernelGetProcessTimeWide();
 #endif
 
+			// Ritmo fijo a g_engine_fps (java.c): el motor avanza 1 tick de logica por
+			// NativeRender, asi que sin esto la velocidad del juego dependia del FPS y del
+			// patron de frameskip (menus acelerados, tirones al caminar).
+			extern volatile int g_engine_fps;
+			static SceUInt64 next_tick_us = 0;
+			int target_fps = cfg_fps == 30 ? 30 : (g_engine_fps > 0 ? g_engine_fps : 21); // 23 = el ritmo que pide el juego
+			SceUInt64 period_us = 1000000 / target_fps;
+			SceUInt64 tick_now = sceKernelGetProcessTimeWide();
+			if (next_tick_us == 0) next_tick_us = tick_now;
+
 #ifdef ZENONIA_FRAMESKIP
-			static int s_frameskip_counter = 0;
+			static int s_auto_skips = 0;
 			// Frame Skip multi-nivel en todo el juego (Title, Menu, Gameplay)
 			switch (g_frameskip_mode) {
-				case FRAMESKIP_1_5X: // Salta 1 de cada 3 frames
-					g_frameskip_is_skip_frame = ((s_frameskip_counter % 3) == 0);
-					break;
-				case FRAMESKIP_2_0X: // Salta 1 de cada 2 frames
-					g_frameskip_is_skip_frame = ((s_frameskip_counter % 2) == 1);
-					break;
-				case FRAMESKIP_2_5X: { // Salta 3 de cada 5 frames
-					int mod5 = s_frameskip_counter % 5;
-					g_frameskip_is_skip_frame = (mod5 == 1 || mod5 == 3 || mod5 == 4);
-					break;
-				}
-				case FRAMESKIP_3_0X: // Salta 2 de cada 3 frames
-					g_frameskip_is_skip_frame = ((s_frameskip_counter % 3) != 0);
+				case FRAMESKIP_AUTO: // Atrasado mas de 1 tick: no dibujar este, alcanzar en logica
+					g_frameskip_is_skip_frame = (tick_now > next_tick_us + period_us) && s_auto_skips < FRAMESKIP_AUTO_MAX;
+					s_auto_skips = g_frameskip_is_skip_frame ? s_auto_skips + 1 : 0;
 					break;
 				default: // FRAMESKIP_OFF
 					g_frameskip_is_skip_frame = 0;
 					break;
 			}
-			s_frameskip_counter++;
 #endif
 
 			if (!g_frameskip_is_skip_frame) {
@@ -998,7 +1051,9 @@ int main() {
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			SceUInt64 fp_before_clet = sceKernelGetProcessTimeWide();
 #endif
-			if (handleCletEvent && eq_head != eq_tail) {
+			// Vaciar la cola entera (como Zenonia 3): de a 1 por frame agregaba latencia y, con la cola
+			// llena, perdia eventos (un RELEASE perdido = direccion trabada).
+			while (!vitamenu_active() && handleCletEvent && eq_head != eq_tail) {
 				input_event *ev = &event_queue[eq_head];
 				eq_head = (eq_head + 1) % 16;
 				handleCletEvent(jniEnv, NULL, ev->type, ev->p1, ev->p2, ev->p3);
@@ -1012,14 +1067,19 @@ int main() {
 			// (dynlib.c), justo despues del draw del FB base del motor -- aca no
 			// hay nada que hacer.
 #endif
-			if (NativeRender) NativeRender(jniEnv, NULL);
+			// Menu de opciones abierto: el juego queda en pausa debajo (no se llama NativeRender).
+			if (NativeRender && !vitamenu_active()) NativeRender(jniEnv, NULL);
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			SceUInt64 fp_after_render = sceKernelGetProcessTimeWide();
 			frame_phase_cletevent_accum_us += (fp_after_clet - fp_before_clet);
 			frame_phase_nativerender_accum_us += (fp_after_render - fp_after_clet);
 #endif
-			rgb565_upload_accum += g_rgb565_uploads_this_frame;
-			g_rgb565_uploads_this_frame = 0;
+		rgb565_upload_accum += g_rgb565_uploads_this_frame;
+		g_rgb565_uploads_this_frame = 0;
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+		upload_us_accum += g_upload_us_this_frame;
+#endif
+		g_upload_us_this_frame = 0;
 			drawnative_calls_accum += g_drawnative_calls_this_frame;
 			g_drawnative_calls_this_frame = 0;
 			cgxpzxani_draw_calls_accum += g_cgxpzxani_draw_calls_this_frame;
@@ -1068,9 +1128,17 @@ int main() {
 				// dibujaba Android como ImageView/ImageButton superpuestos al
 				// GLSurfaceView (ver androidui.c). Sin capa Java, hay que
 				// replicarlo aca.
-				androidui_draw(g_ui_status, SCREEN_W, SCREEN_H);
-				osd_draw();
-				vglSwapBuffers(GL_FALSE);
+			androidui_draw(g_ui_status, SCREEN_W, SCREEN_H);
+			osd_draw();
+			vitamenu_draw(SCREEN_W, SCREEN_H);
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+			SceUInt64 swap_t0 = sceKernelGetProcessTimeWide();
+#endif
+			vglSwapBuffers(GL_FALSE);
+			g_presented_frames++;
+#ifdef ZENONIA_INSTRUMENT_UPLOAD_PHASES
+			swap_us_accum += sceKernelGetProcessTimeWide() - swap_t0;
+#endif
 			}
 #ifdef ZENONIA_INSTRUMENT_FRAME_PHASES
 			// "rest" = todo lo que NO es handleCletEvent ni NativeRender:
@@ -1084,6 +1152,12 @@ int main() {
 			SceUInt64 fp_render = fp_after_render - fp_after_clet;
 			frame_phase_rest_accum_us += (fp_total > fp_clet + fp_render) ? (fp_total - fp_clet - fp_render) : 0;
 #endif
+			next_tick_us += period_us;
+			SceUInt64 end_now = sceKernelGetProcessTimeWide();
+			if (end_now < next_tick_us)
+				sceKernelDelayThread((SceUInt32)(next_tick_us - end_now)); // adelantado: no correr mas rapido que el original
+			else if (end_now - next_tick_us > 4 * period_us)
+				next_tick_us = end_now; // deuda imposible de pagar (carga, CPU lento): no acelerar despues
 		}
 	}
 

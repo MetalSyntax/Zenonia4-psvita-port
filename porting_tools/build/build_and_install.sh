@@ -108,6 +108,8 @@ echo " vita-pack-vpk con rutas con espacios -- ver toolchain_gotchas.md)"
 VPK_OUTPUT_NAME="zenonia_4"
 case "$BUILD_FLAG" in
     --neon-fallback) VPK_OUTPUT_NAME="zenonia_4_neonfallback" ;;
+    --pace) VPK_OUTPUT_NAME="zenonia_4_pace" ;;
+    --pace-nologs) VPK_OUTPUT_NAME="zenonia_4_pace_nologs" ;;
     --drawnative-probe) VPK_OUTPUT_NAME="zenonia_4_drawnative_probe" ;;
     --hotpath-probe) VPK_OUTPUT_NAME="zenonia_4_hotpath_probe" ;;
     --neon-libc-test) VPK_OUTPUT_NAME="zenonia_4_neonlibc_test" ;;

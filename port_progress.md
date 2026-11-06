@@ -5363,3 +5363,257 @@ Combinar las 3 técnicas de aceleración en un solo paquete de alto rendimiento:
 
 
 
+
+### Fase 124 (2026-09-04) - Pantalla negra permanente desde el arranque en todos los builds nuevos: causa real `SOFTFP_ABI=1` ausente en la vitaGL vendorizada + receta DH2
+
+**Sintoma (reporte del usuario):** todo build compilado desde ~Sep-2026 muestra pantalla
+negra desde el arranque, con sonido, rendimiento e input perfectos (se podia jugar a ciegas
+guiado por el sonido), pero sin ningun sprite ni overlay visible (ni siquiera el banner OSD
+"FRAME SKIP" ni el arte de androidui del menu). Ultimo build bueno conocido: turbo del
+31/08 (sprites visibles, 11-19 FPS, `logs/log_1788567345.txt`). Build de control bueno
+anterior: `vpk_backups/zenonia_4.vpk` (25-jul).
+
+**Lo que el log probaba (no era el motor):** en todos los logs fallidos el motor arranca
+identico a los builds buenos (assets con bytes correctos,
+`NativeInitWithBufferSize/DeviceInfo/Resize/ResumeClet` sin errores,
+`OnUIStatusChange: -1 -> 1 -> 19 -> 14`, uploads RGB565 960x544 + quad fullscreen con
+vertices/UVs correctos por frame, FPS real). Contadores de sprites en 0.0 porque son
+diagnostico compilado (`INSTRUMENT_*` OFF), no porque el motor no dibuje. Conclusion
+intermedia: presentacion rota, motor sano.
+
+**Hipotesis probadas y descartadas (con evidencia, no a ojo):**
+1. Trampolines "zero-syscall" de Turbo (`PutCompressImg`/`DrawNative`/`Ellipse`):
+   EXONERADOS -- verificados byte a byte con `arm-vita-eabi-objdump` contra el `.so`
+   real (los 8 bytes replicados + `resume_addr = base+8` caen en la instruccion exacta).
+2. ABI float del vendor: EXONERADA como causa directa -- el gcc del vitasdk defaultea a
+   `softfp`, asi que compilar sin `SOFTFP_ABI=1` linkea igual (pero OJO: ver punto 6,
+   el define `HAVE_SOFTFP_ABI` si cambia caminos de codigo).
+3. OSD (`osd_draw`, nuevo en Turbo): BUG REAL pero no la causa -- dejaba
+   `GL_TEXTURE_2D` deshabilitado, arrays de texcoord/color deshabilitados, blend
+   cambiado y `glVertexPointer` colgando de su stack (misma clase que Fase 49; el
+   motor no repara estado). Fix escrito (`zenonia_restore_engine_gl_state()` desde
+   las sombras + llamada al final del OSD) pero el negro persistio sin OSD activo.
+   Fix guardado en `stash@{0}` pendiente de rescatar.
+4. Flags Turbo (FrameSkip/FastClear/RGB565-direct): EXONERADOS -- `--neon-fallback`
+   restaurado a config 2024 real (RGB565 OFF + FASTCLEAR OFF + FRAMESKIP OFF) siguio
+   negro. NOTA: ese restore encontro que `--neon-fallback` ya no era fallback
+   (`tmp.diff` lo habia pasado a ON/ON, casi identico al default).
+5. Version de vitaGL (2026 vs 2024): EXONERADA como version -- fallaron system-2026,
+   vendor-2026, vendor-Dic2024 (c3b874c) y vendor-Abr2024 (b61dcae), todos negro.
+6. `NO_DEBUG=1` (`-DSKIP_ERROR_HANDLING`): EXONERADO -- rebuild sin el siguio negro.
+7. `system_app_mode` (precedente real de Zenonia3-vita, Sep-2026, mismo sintoma mismo
+   setup UNSAFE/NOASLR+kubridge): parche `#if 0` aplicado y probado -- NO arreglo Z4
+   (el negro de Z4 era otro). Parche guardado en `stash@{0}` (`patches/`).
+
+**Pista decisiva (del usuario + Dungeon-Hunter-2-vita):** lo ultimo pedido antes de
+romper eran "hacks de vitaGL", y DH2 corre 2026-master a 20-25 FPS en la misma consola
+con su set BASE de flags (ver su `CMakeLists.txt`):
+`SOFTFP_ABI=1 NO_DEBUG=1 HAVE_SHADER_CACHE=1 NO_SPLASHSCREEN=1 HAVE_GLSL_UBOS=1 SAMPLERS_SPEEDHACK=1 DRAW_SPEEDHACK=2`.
+Z4 compilaba su vendor SIN `SOFTFP_ABI=1` (ni ningun flag). La lib vdpm-2024 que
+funcionaba venia del mirror softfp (construida con ese ABI). Sin el define, vitaGL toma
+caminos de codigo incompatibles con softfp -> presentacion muerta aunque cada llamada GL
+individual "funcione" (encaja con: uploads+dibujos emitidos, swap corriendo, todo negro,
+cero crashes).
+
+**Fix aplicado (verificado en consola 2026-09-04, `build/zenonia_4_turbo.vpk` 21:25):**
+- `vendor/vitaGL` = copia del arbol de DH2 (2026 master cd3791e + sus mods de compat
+  con este vitasdk) + `source/egl.c` restaurado de upstream (DH2 lo borra porque tiene
+  reimpl propia; Z4 no) + autodeteccion system_app deshabilitada (`#if 0` en
+  `source/gxm.c`, belt-and-braces por el precedente Z3).
+- `CMakeLists.txt`: bloque ExternalProject con `separate_arguments(... UNIX_COMMAND ...)`
+  (OBLIGATORIO: sin esto CMake pasa todos los flags como un unico argumento y `make`
+  los ignora en silencio -- un build entero se "probo" asi sin que nadie lo notara) y
+  `BUILD_COMMAND make ${VITAGL_MAKE_FLAGS}` con el set DH2. vitashark sigue del
+  sistema, igual que DH2. Verificado en el log de build: `-mfloat-abi=softfp
+  -DHAVE_SOFTFP_ABI ... -DSAFER_DRAW_SPEEDHACK ...` compilando de verdad.
+- `build.sh`: `--delete` en el rsync de staging + borrado de `*-prefix` (stamps de
+  ExternalProject). Sin ambas cosas, cambiar el arbol vendor NO recompila nada
+  (objetos viejos por mtimes + step "ya hecho") y los "builds aislados" linkean la
+  version anterior -- asi se explican los "vendorice 2024 y sigue igual": nunca se
+  compilo 2024 de verdad.
+
+**Trampas del sistema de build encontradas en el camino (ya arregladas en el arbol):**
+rsync sin `--delete`, stamps de ExternalProject que saltan el make vendorizado, y
+paso de flags sin `separate_arguments`. Las tres producen builds en silencio
+diferentes a lo pedido.
+
+**Pendiente (no tocar sin leer esto):**
+- `stash@{0}` ("sesion-negro-2026-09-04") guarda: fix OSD
+  (`zenonia_restore_engine_gl_state`), restore de `--neon-fallback` a config 2024,
+  experimento `BUILD_COMMAND make` pelado, y `patches/vitagl-disable-system-app-mode.patch`
+  contra abril-2024. Rescatar al menos el fix OSD (bug objetivo, el banner Turbo lo
+  necesita) y decidir el resto.
+- `vendor/` esta en `.gitignore`: el pin real hoy es "copia de DH2 + egl.c + #if 0
+  sysapp". Si DH2 sube su pin, re-evaluar. Respaldos utiles en /tmp (volatil):
+  `/tmp/vendor-backup/vitaGL-2026` (arbol previo propio) y `/tmp/vitagl-ref`
+  (clon completo con historial para futuros bisects).
+- Reconstruir las variantes (`--turbo-nologs`, default, etc.) contra esta receta y
+  re-medir FPS antes de darlas por buenas.
+
+### Fase 125 (2026-09-05) - Multithreading: medido antes de prometer; hacks vitaGL ~0; RLE diseccionado; cache-test a hardware
+
+**Pedido:** repartir el juego en los 3 cores (un core al 100%). Realidad: `NativeRender`
+es monohilo por diseno (juego 2011) y no se puede trocear sin reescribir el motor.
+Nucleo 0 = juego, nucleo 1 = audio (ya). Lo unico paralelizable real: solapar
+upload+present con el siguiente frame (pipeline, no 3 cores a tope).
+
+**Medicion (`--upload-probe`, flag nuevo `INSTRUMENT_UPLOAD_PHASES`, linea
+`[UploadPhases]`):** combate `ui_status=14`: NativeRender 73-90ms, upload ~17ms
+promedio (con FrameSkip 2x la subida corre 1 de cada 2 frames -> **~34ms por frame
+presentado, ~1/3 del frame**), swap 0.1ms (sin vblank que ate). Resto ~1ms.
+Conclusion: pipeline que oculte esos 34ms -> ~11 a ~17 FPS. Justificado; swap gratis.
+
+**Hacks vitaGL (`--turbo-hacks-test`: MATH/CIRCULAR_POOL/WVP_ON_GPU/NO_TILE_CLIPPER/
+PRIMITIVES/NO_TEX_COMBINER, cada uno validado contra logs -- motor solo usa TexEnv
+REPLACE y draws TRIANGLES):** 12-15 FPS vs 14-15 del turbo en gameplay. ~0, como
+era de esperar (la GPU estaba ociosa; el cuello es CPU del motor). Excluidos a
+proposito TEXTURES_SPEEDHACK (toca el upload) y todo lo que cuelga GPU.
+
+**Anatomia RLE (`out_ghidra.c` `DrawOP_COPY_Compress_16`):** por pixel, lookup
+`dest = pal[src_byte]` (paleta 256x16b = 512B, cabe en L1) con Duff 8x. El costo es
+trafico de memoria, no ALU -- por eso recompilar en C moderno (Fase 85) no midio
+nada. Lo que ahorra es EVITAR trabajo: cache de decodificados (ya construida,
+Fase 95-100) o fast-path de memcpy para sprites opacos.
+
+**Siguiente paso:** `build/zenonia_4_sprite_decode_cache_test.vpk` (OPTIMIZE+CACHE,
+sin ExAlpha) a consola: FPS + corrupcion visible + `avg_sprite_cache_hits/misses`.
+Si hit alto sin corrupcion -> fast-path opaco encima; si no -> pipeline async.
+
+### Fase 126 (2026-11-05) - FB_TEX_RING: matar el copy-on-write de vitaGL en el upload (pendiente hardware)
+
+**Disparador:** comentario de usuario: "10 fps con todo en bajo y frameskip, menus por
+debajo de 10, el personaje da tirones caminando".
+
+**Causa encontrada (codigo, no medida aun):** `glDrawFrame` (out_ghidra.c) llama
+`glTexSubImage2D` sobre la MISMA textura cada frame. vitaGL (`textures.c:983`, sin
+TEXTURES_SPEEDHACK) ve la textura usada hace <=4 frames y hace alloc nuevo + memcpy de la
+textura ENTERA + free antes de escribir -- y `glInit` la crea cuadrada (lado = ancho del
+dispositivo, ~2MB en RGB565). Eso explica buena parte de los ~17ms de upload de Fase 125.
+
+**Fix (`FB_TEX_RING`, `--turbo-ring-test`):** 3 texturas rotando (id original del motor +
+2 clones CLAMP/LINEAR creados en `glTexImage2D_wrapper`); `glTexSubImage2D_wrapper` avanza
+el anillo y hace memcpy por fila directo a `vglGetTexDataPointer` (stride
+`ALIGN(w,8)*2`); `glBindTexture_wrapper` remapea el id del motor a la copia actual.
+Incompatible con GPU_QUADS (`#error`). Build con UPLOAD_PHASES para comparar.
+
+**DXT (tecnica de PoP Sands of Time):** descartada a proposito. Alli comprime texturas
+ESTATICAS cargadas una vez; aca la unica textura es el framebuffer de CPU regenerado cada
+frame -- comprimirlo cada frame cuesta mas CPU que la copia que ahorraria, y la GPU ya
+esta ociosa (Fase 125). Los sprites nunca son texturas (los dibuja la CPU en el FB).
+
+**Validar en consola:** FPS vs turbo en menu y combate; `[UploadPhases] upload=` contra
+~17ms; buscar tearing/frames viejos (si aparecen: subir FB_RING_N).
+
+### Fase 127 (2026-11-05) - El juego original corre a 21/23 FPS: ritmo fijo + frameskip AUTO; logs numerados .log
+
+**Hardware (log Fase 126, `--turbo-ring-test`):** FB_TEX_RING funciona: `[UploadPhases]
+upload=2.8ms` (antes ~17ms), swap 0.17ms. Combate 13-14 ticks/s. El cuello ya es solo
+`NativeRender` (~70ms).
+
+**Hallazgo:** `setFrameSpeed` (out_ghidra.c) -> `Natives.SetSpeed` -> `NexusGLThread.SetFPS`:
+el hilo GL de Android dormia hasta `1000/speed` ms por frame. Logs: **21** en logo/menus,
+**23** en gameplay. El motor avanza 1 tick por `NativeRender` (`threadCallback` llama el
+timer sin mirar el intervalo), y el loader ignoraba `SetSpeed`: menus a ~30 ticks/s
+(demasiado rapidos), combate a ~14 (camara lenta) y el frameskip de patron fijo cambiaba la
+velocidad del juego cada pocos frames -> "el personaje da tirones caminando". **30 FPS no es
+un objetivo valido**: el juego original nunca paso de 23; correr la logica a 30 lo acelera 1.3x.
+
+**Fix:** `g_engine_fps` (java.c) desde `SetSpeed`; main.c ritma el loop a `1000000/fps` us
+(duerme si va adelantado, suelta la deuda si va >4 ticks atrasado) y nuevo modo
+`FRAMESKIP_AUTO` (default, R+SELECT sigue ciclando): salta el dibujo solo si va >1 tick
+atrasado, max 3 seguidos. Nueva linea `[Pace] target= ticks_fps= shown_fps=`: `fps=` de
+"frame N alive" siempre conto ticks, no frames presentados.
+
+**Logs:** `ux0:data/zenonia-4/logs/log_NNNN.log` (primer numero libre) en vez de
+`log_<timestamp>.txt`.
+
+**Validar en consola:** `[Pace]` en combate: ticks_fps ~23 (velocidad correcta) y
+shown_fps; menus ya no acelerados; caminar recto sin tirones de velocidad.
+
+### Fase 128 (2026-11-05) - Un solo VPK: R+SELECT frameskip, L+SELECT FPS 23/30
+
+**Hardware (log_0001.log, Fase 127):** AUTO confirmado: `ticks_fps` 22-23 (velocidad
+original), `shown_fps` ~8.8 en combate.
+
+**Nuevo:** `g_fps_forced` en main.c, runtime. L+SELECT alterna 23 (= lo que pide el juego
+via SetSpeed, 21 menus / 23 gameplay) y 30 (forzado estilo Zenonia 2/3, juego ~1.3x mas
+rapido). R+SELECT sigue ciclando frameskip (AUTO/OFF/1.5x..3x). Arranca en AUTO + 23.
+`build.sh --pace` -> `build/zenonia_4_pace.vpk` (Turbo + FB_TEX_RING + logs). (Se probo
+antes un esquema de 4 VPKs por flags de CMake; descartado a pedido del usuario.) `[Pace]`
+loguea `target=`, `game_speed=`, `skip_mode=` y cada cambio de FPS.
+
+**Limite fisico (no un bug):** en OFF cada tick dibuja, y `NativeRender` cuesta ~70ms en
+combate -> ~14 ticks/s maximo: 23/30 es un TECHO, no se alcanza en combate sin saltar
+dibujo (camara lenta ahi). En menus/mapas livianos si llega.
+
+### Fase 129 (2026-11-06) - Menu de opciones de Zenonia 3 (START+SELECT), R+L botones en pantalla, cola de input
+
+**Hardware (log_0002.log):** 23 + OFF en combate: 11.8 y 19.0 ticks/s segun la escena (=
+shown, OFF dibuja todo). AUTO sigue clavado en ~22-23 ticks/s. OFF no puede llegar a 23 en
+combate pesado: es `NativeRender` (~70ms, motor monohilo), no el loader -- VSync ya medido
+sin ganancia (Fase 35), upload ya en ~1.6ms (Fase 126).
+
+**Portado de Zenonia3-vita/loader:** `config.c/h` (`ux0:data/zenonia-4/config.txt` +
+`controls.txt`, editables a mano) y `vitamenu.c/h` (mismos codigos HAL que Z3). Cambios:
+fps 23 (= SetSpeed del juego) / 30 en vez de 22/30; botones visibles por default; sin fondo
+con el ultimo frame (Z4 no expone la textura del FB igual -- FB_TEX_RING la rota).
+- START+SELECT: abre/cierra el menu (remapeo X reemplaza / Cuadrado agrega / Triangulo
+  borra; FPS; botones en pantalla). Juego en pausa debajo. **Ya no es salida de emergencia**
+  (salir con el boton PS).
+- R+L: alterna botones en pantalla. `CZnTouchKeypad::Draw` pasa de no-op permanente (bajo
+  HIDE_VIRTUAL_GAMEPAD) a hook siempre instalado que llama al original solo si visibles
+  (unhook/rehook por frame solo con visibles). El touch de la cruceta sigue andando oculto.
+- L+SELECT FPS ahora persiste en config.txt (`g_fps_forced` -> `cfg_fps`).
+- Input por ACCIONES (remapeo + stick izquierdo, `SCE_CTRL_MODE_ANALOG`) en vez de `btn_map`.
+  Botones de un combo suprimidos hasta soltarlos.
+- Cola de input: se vacia entera por frame (antes 1 evento/frame: latencia a ~10 FPS y,
+  con la cola de 16 llena, eventos perdidos -> direccion trabada). Igual que Z3.
+
+**Validar:** menu abre/cierra y guarda; remapeo funciona en juego; R+L oculta/muestra sin
+romper el touch; L no dispara Guardar al hacer L+SELECT / R+L (si L se aprieta primero, si
+llega -- mismo comportamiento que Z3).
+
+### Fase 130 (2026-11-06) - Frameskip solo AUTO/OFF, mensajes OSD en ingles, botones en pantalla sin costo por frame
+
+**Hardware (log_0003.log):** menu, remapeo, R+L, L+SELECT y config confirmados OK por el
+usuario. AUTO a 23: ticks 22.9-23.2 (velocidad exacta). **Botones visibles: shown ~8-9;
+ocultos (R+L): shown 10-14, pico 18.8.** Estimacion con esos numeros: frame dibujado ~70ms,
+frame saltado ~14ms -> AUTO alterna dibujado/saltado (~84ms cada 2 ticks, parejo).
+
+**Cambios:**
+- Frameskip: solo AUTO (default) y OFF. Los patrones fijos 1.5x-3x cambiaban la velocidad
+  del juego (lo que causaba los tirones originales) y AUTO los cubre.
+- OSD en ingles ("START+SELECT: OPTIONS   R+L: BUTTONS", "FPS: 23 (ORIGINAL SPEED)", ...).
+- Botones en pantalla: la Fase 129 hacia unhook/rehook (2 syscalls kubridge + 2 flush de
+  i-cache) en CADA frame con botones visibles -- parte del costo medido arriba. Ahora se
+  escribe `bx lr` (0x4770) en la entrada Thumb de `CZnTouchKeypad::Draw` (1ra instr
+  `push {r4,lr}`, objdump 0x12d42c) solo al alternar R+L / cerrar el menu; visible =
+  instruccion original. Costo por frame: cero en ambos estados.
+
+**Techo para "23 fluidos" (no cambiado):** 23 dibujados/s exige frame dibujado <=43ms; hoy
+~70ms, dentro de `NativeRender` (motor monohilo, dibujo por software). Nada del lado del
+loader queda por recortar que se acerque a 27ms (upload 1.6ms, swap 0.1ms, VSync medido
+sin ganancia). Ocultar botones es lo mas grande que aparecio (~20% de shown_fps).
+
+### Fase 131 (2026-11-06) - Sin OSD al arrancar, release `--pace-nologs`, RELEASE_NOTES v1.1.0; analisis multinucleo
+
+**Hardware (log_0004.log):** botones ocultos desde config.txt, parche `bx lr` aplicado
+(`instr 0xb510` leida = `push {r4,lr}`, coincide con objdump). AUTO: ticks 23.0-23.2,
+shown 9.6-12.5.
+
+**Cambios:** sin mensaje OSD al arrancar (solo al cambiar algo). `build.sh --pace-nologs`
+(= --pace con ENABLE_LOGGING=OFF) -> `zenonia_4_pace_nologs.vpk`, el de release.
+RELEASE_NOTES.md reescrito para v1.1.0 con tabla de defaults; tabla de controles del README
+actualizada (el resto del README todavia describe el FrameSkip multi-nivel viejo).
+
+**Multinucleo (pedido: "solo se usa un nucleo"):** hoy nucleo 0 = juego, 1 = audio, 2 libre.
+`NativeRender` es un solo hilo del motor (logica+dibujo fusionados) -- no se reparte.
+Unico candidato real: los blits de sprites (`PutCompressImg`, ~60% del frame dibujado segun
+`--skip-blit-test` Fase 47). Diseno posible: grabar los blits a FB (`p9==0`) en una lista y
+ejecutarla al final del frame en 3 franjas horizontales en paralelo (cada nucleo hace TODOS
+los blits recortados a su franja, en orden -> orden por pixel intacto). Riesgo: cualquier
+otra escritura/lectura del FB intercalada (texto, fills, RGBBlend16, efectos de pantalla que
+LEEN el FB) queda desordenada respecto a los sprites diferidos -> hay que vaciar la lista
+antes de cada una, y CLAUDE.md ya advierte que hay caminos de escritura directa no
+encontrados. Ganancia teorica ~70ms -> ~50ms por frame dibujado (bus de memoria compartido:
+probablemente menos). No implementado: experimento grande, pendiente decision del usuario.
