@@ -23,16 +23,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef enum { ROW_ACTION, ROW_FPS, ROW_VBUTTONS, ROW_DEFAULTS, ROW_CLOSE } row_kind;
+typedef enum { ROW_ACTION, ROW_FRAMESKIP, ROW_FPS, ROW_VBUTTONS, ROW_DEFAULTS, ROW_CLOSE } row_kind;
 
-#define ROW_COUNT (ACT_COUNT + 4)
+#define ROW_COUNT (ACT_COUNT + 5)
 
 #define PANEL_X 80
 #define PANEL_Y 24
 #define PANEL_W 800
 #define PANEL_H 496
 #define FONT_PX 22.0f
-#define ROW_H   30
+#define ROW_H   28 /* 14 filas: 64 + 14*28 = 456, entra sobre el pie (462) */
 #define LIST_Y  64
 
 #define REPEAT_DELAY 400000
@@ -64,7 +64,7 @@ static uint32_t *text_buf;
 static int dirty = 1;
 
 static row_kind kind_of(int r) {
-    return r < ACT_COUNT ? ROW_ACTION : (row_kind) (ROW_FPS + (r - ACT_COUNT));
+    return r < ACT_COUNT ? ROW_ACTION : (row_kind) (ROW_FRAMESKIP + (r - ACT_COUNT));
 }
 
 int vitamenu_active(void) { return open; }
@@ -129,6 +129,9 @@ void vitamenu_update(uint32_t held, uint32_t pressed) {
         else if (pressed & SCE_CTRL_SQUARE)   capture = 2;
         else if (pressed & SCE_CTRL_TRIANGLE) cfg_binds[sel] = 0;
         break;
+    case ROW_FRAMESKIP:
+        if (toggle) cfg_frameskip_off = !cfg_frameskip_off;
+        break;
     case ROW_FPS:
         if (toggle) cfg_fps = cfg_fps == 30 ? 23 : 30;
         break;
@@ -166,6 +169,7 @@ static const char *footer(void) {
     if (capture) return "Press the new button     START: cancel";
     switch (kind_of(sel)) {
     case ROW_ACTION:   return "Up/Down: move   Cross: set   Square: add   Triangle: clear   Circle: save";
+    case ROW_FRAMESKIP:
     case ROW_FPS:
     case ROW_VBUTTONS: return "Up/Down: move   Cross / Left / Right: change   Circle: save and close";
     default:           return "Up/Down: move   Cross: select   Circle: save and close";
@@ -190,12 +194,16 @@ static void render_text(void) {
             else
                 config_buttons_text(cfg_binds[r], value, sizeof(value));
             break;
+        case ROW_FRAMESKIP:
+            label = "Frame skip  (R+SELECT)";
+            snprintf(value, sizeof(value), cfg_frameskip_off ? "< Off >" : "< Auto (smoother) >");
+            break;
         case ROW_FPS:
-            label = "Frame rate";
+            label = "Frame rate  (L+SELECT)";
             snprintf(value, sizeof(value), cfg_fps == 30 ? "< 30 fps (fast, Zenonia 2/3) >" : "< 23 fps (original speed) >");
             break;
         case ROW_VBUTTONS:
-            label = "On-screen buttons";
+            label = "On-screen buttons  (R+L)";
             snprintf(value, sizeof(value), cfg_vbuttons_opacity ? "< Visible (100%%) >" : "< Hidden (0%%) >");
             break;
         case ROW_DEFAULTS: label = "Restore defaults"; break;

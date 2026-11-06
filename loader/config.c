@@ -22,6 +22,7 @@ extern void game_log(const char *fmt, ...);
 #endif
 
 int cfg_fps = 23;
+int cfg_frameskip_off = 0;
 int cfg_vbuttons_opacity = 100;
 uint32_t cfg_binds[ACT_COUNT];
 
@@ -75,6 +76,7 @@ void config_buttons_text(uint32_t mask, char *out, size_t size) {
 
 void config_defaults(void) {
     cfg_fps = 23;
+    cfg_frameskip_off = 0;
     cfg_vbuttons_opacity = 100;
     for (int i = 0; i < ACT_COUNT; i++) cfg_binds[i] = actions[i].def;
 }
@@ -115,6 +117,7 @@ void config_load(void) {
             int n = 0;
             sscanf(val, "%d", &n);
             if (!strcmp(key, "FPS")) cfg_fps = n == 30 ? 30 : 23;
+            else if (!strcmp(key, "FRAMESKIP")) cfg_frameskip_off = n == 0;
             else if (!strcmp(key, "VIRTUAL_BUTTONS")) cfg_vbuttons_opacity = n > 0 ? 100 : 0;
         }
         fclose(f);
@@ -137,6 +140,7 @@ void config_save(void) {
     FILE *f = fopen(CONFIG_PATH, "w");
     if (f) {
         fprintf(f, "# 23 (the speed the original game runs at, 21 in menus) or 30 (faster, Zenonia 2/3 style)\nfps = %d\n", cfg_fps);
+        fprintf(f, "# 1 = AUTO (skip drawing only when the game falls behind), 0 = OFF\nframeskip = %d\n", !cfg_frameskip_off);
         fprintf(f, "# On-screen D-pad/action buttons opacity: 0 (hidden, still touchable) or 100\n"
                    "virtual_buttons = %d\n", cfg_vbuttons_opacity);
         fclose(f);

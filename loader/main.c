@@ -470,6 +470,9 @@ int main() {
     init_log();
     config_load();
     config_save(); // escribe config.txt/controls.txt completos para editarlos a mano
+#ifdef ZENONIA_FRAMESKIP
+    g_frameskip_mode = cfg_frameskip_off ? FRAMESKIP_OFF : FRAMESKIP_AUTO;
+#endif
 	game_log("Iniciando Zenonia 4 port (SoLoader)\n");
 #ifdef ZENONIA_BUILD_VARIANT
 	// Fase 85 (port_progress.md): identifica el build variant en la
@@ -834,6 +837,9 @@ int main() {
 			if (menu_was_open && !vitamenu_active()) {
 				suppressed = pad.buttons;
 				zenonia_set_vbuttons_visible(cfg_vbuttons_opacity > 0); // el menu pudo cambiarlo
+#ifdef ZENONIA_FRAMESKIP
+				g_frameskip_mode = cfg_frameskip_off ? FRAMESKIP_OFF : FRAMESKIP_AUTO;
+#endif
 			}
 
 			// Atajos fuera del menu: R+SELECT frameskip, L+SELECT FPS 23/30, R+L botones en pantalla.
@@ -846,6 +852,8 @@ int main() {
 #ifdef ZENONIA_FRAMESKIP
 				if (COMBO_HIT(COMBO_FS)) {
 					g_frameskip_mode = (g_frameskip_mode + 1) % FRAMESKIP_COUNT;
+					cfg_frameskip_off = g_frameskip_mode == FRAMESKIP_OFF;
+					config_save();
 					const char *mode_str = g_frameskip_mode == FRAMESKIP_AUTO ? "FRAME SKIP: AUTO" : "FRAME SKIP: OFF";
 					osd_show_message(mode_str, 90);
 					game_log("[FrameSkip] Modo cambiado a: %s (mode=%d)\n", mode_str, g_frameskip_mode);

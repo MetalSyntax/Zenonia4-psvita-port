@@ -19,6 +19,7 @@ typedef enum {
 } action_id;
 
 extern int cfg_fps;              /**< 23 = the speed the game asks for (SetSpeed 21/23), 30 = forced (Zenonia 2/3 style). */
+extern int cfg_frameskip_off;     /**< 0 = AUTO (default), 1 = OFF. */
 extern int cfg_vbuttons_opacity; /**< Virtual D-pad/action buttons: 0 (invisible, still touchable) or 100. */
 extern uint32_t cfg_binds[ACT_COUNT]; /**< SCE_CTRL_* mask per action. */
 

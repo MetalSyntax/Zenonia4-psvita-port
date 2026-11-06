@@ -5643,3 +5643,21 @@ Si par_split ~0 -> p4 no es la altura o los sprites grandes no pasan por COPY si
 
 **DXT para sprites:** no aplica (ver Fase 126): los sprites nunca son texturas, la CPU los
 dibuja en el framebuffer; la unica textura es el FB regenerado cada frame.
+
+### Fase 133 (2026-11-06) - PARALLEL_SPRITES confirmado en consola (~11 -> ~18 FPS); Frame skip en el menu
+
+**Hardware (log_0005.log, `--parallel-test`):** AUTO: shown_fps 15.1-20.0 (antes 9.6-12.5
+en la misma build sin paralelo), ticks 23. OFF: 16.7-17.6 ticks=shown (antes 11-14).
+`par_split` ~37k-55k por 120 frames (~375-450 sprites partidos por frame dibujado),
+`par_alone` 15-270 (workers dormidos al empezar un frame). Usuario: "mas fluido y jugable",
+cortes a ~12 en las peores escenas; nucleos 93-100% (los workers hacen spin entre sprites).
+Sin reportes de cortes en sprites ni de audio.
+
+**Resolucion interna como opcion del menu:** descartada -- `--downsample-test` (Fase 37,
+640x362) midio sin cambio de FPS ni de imagen; el motor dibuja los assets a tamano fijo.
+"Sprites mas chicos tipo Zenonia 3": Z3 es otro juego con assets de menor resolucion; aca
+achicarlos solo es posible bajando la resolucion del motor, que da zoom (Fase 16/17).
+
+**Menu START+SELECT:** nueva fila "Frame skip (R+SELECT)" Auto/Off; las filas muestran su
+atajo ("Frame rate (L+SELECT)", "On-screen buttons (R+L)"). `frameskip = 1|0` en config.txt
+(persiste entre sesiones, tambien al usar R+SELECT). ROW_H 30 -> 28 para que entren 14 filas.
