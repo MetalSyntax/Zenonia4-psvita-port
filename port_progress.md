@@ -5617,3 +5617,29 @@ LEEN el FB) queda desordenada respecto a los sprites diferidos -> hay que vaciar
 antes de cada una, y CLAUDE.md ya advierte que hay caminos de escritura directa no
 encontrados. Ganancia teorica ~70ms -> ~50ms por frame dibujado (bus de memoria compartido:
 probablemente menos). No implementado: experimento grande, pendiente decision del usuario.
+
+### Fase 132 (2026-11-06) - Release v1.1.0 publicada; EXPERIMENTO PARALLEL_SPRITES (3 nucleos); DXT descartado otra vez
+
+**Release:** commit 4ee9c7e en master, tag `1.1.0`, assets `zenonia_4_pace_nologs.vpk`
+(recomendado) + `zenonia_4_pace.vpk`. Fuera del commit a proposito (no son de esta sesion):
+borrado de `psvita-port-toolkit/*.md` y `.psvita-toolkit.json` sin trackear. Ojo: `vendor/`
+(vitaGL vendorizada, Fase 124) sigue en .gitignore -> un clon limpio NO compila tal cual.
+
+**Experimento (`PARALLEL_SPRITES`, `--parallel-test`, `loader/sprite_parallel.c`):** el
+draw-op COPY sin recorte (formato por filas, `0xfffe` suma stride a la posicion actual) se
+parte en franjas de filas: nucleo 0 la de arriba, workers en nucleo 2 y nucleo 1 (este con
+prioridad 0x10000110, debajo del audio) el resto. Cada franja recorre sin escribir los
+tokens previos acumulando el desplazamiento real. Sincronico por sprite (el principal espera
+las franjas) -> orden respecto a texto/fills/efectos intacto, sin cola diferida. Solo
+h>=24 y area>=32x32; headers Ex [-7,-3] y sprites chicos -> rutina ORIGINAL del motor.
+Workers duermen tras 8ms sin trabajo (si estan dormidos el principal dibuja solo).
+Verificado en host: 20000 sprites aleatorios (filas regulares e irregulares, 1-3 franjas)
+byte-identicos a la referencia = `DrawOP_COPY_Compress_16` de out_ghidra.c:227093.
+`[Pace]` agrega `par_split=` / `par_alone=` (sprites partidos / dibujados solo por 120 frames).
+
+**Validar en consola:** shown_fps en combate vs `--pace` (misma escena, botones igual);
+sprites sin cortes/lineas en las uniones de franjas; audio sin cortes; par_split > 0.
+Si par_split ~0 -> p4 no es la altura o los sprites grandes no pasan por COPY sin recorte.
+
+**DXT para sprites:** no aplica (ver Fase 126): los sprites nunca son texturas, la CPU los
+dibuja en el framebuffer; la unica textura es el FB regenerado cada frame.

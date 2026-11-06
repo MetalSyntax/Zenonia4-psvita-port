@@ -110,6 +110,7 @@ case "$BUILD_FLAG" in
     --neon-fallback) VPK_OUTPUT_NAME="zenonia_4_neonfallback" ;;
     --pace) VPK_OUTPUT_NAME="zenonia_4_pace" ;;
     --pace-nologs) VPK_OUTPUT_NAME="zenonia_4_pace_nologs" ;;
+    --parallel-test) VPK_OUTPUT_NAME="zenonia_4_parallel_test" ;;
     --drawnative-probe) VPK_OUTPUT_NAME="zenonia_4_drawnative_probe" ;;
     --hotpath-probe) VPK_OUTPUT_NAME="zenonia_4_hotpath_probe" ;;
     --neon-libc-test) VPK_OUTPUT_NAME="zenonia_4_neonlibc_test" ;;

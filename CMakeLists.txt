@@ -92,6 +92,17 @@ if (FB_TEX_RING)
   add_definitions(-DZENONIA_FB_TEX_RING=1)
 endif()
 
+## Fase 132: sprites RLE grandes (draw-op COPY) partidos por filas entre nucleo 0 + 2 + 1
+## (loader/sprite_parallel.c). Pixeles identicos; incompatible con SPRITE_DECODE_OPTIMIZE
+## (los dos reemplazan el mismo puntero de SetZeroBlendFunc).
+option(PARALLEL_SPRITES "Split large RLE sprite blits by rows across the 3 user cores" OFF)
+if (PARALLEL_SPRITES)
+  if (SPRITE_DECODE_OPTIMIZE)
+    message(FATAL_ERROR "PARALLEL_SPRITES y SPRITE_DECODE_OPTIMIZE reemplazan el mismo draw-op")
+  endif()
+  add_definitions(-DZENONIA_PARALLEL_SPRITES=1)
+endif()
+
 option(ENABLE_FRAMESKIP "Enable intelligent frame skip on gameplay frames for smooth 20+ FPS on CPU" ON)
 if (ENABLE_FRAMESKIP)
   add_definitions(-DZENONIA_FRAMESKIP=1)
@@ -454,6 +465,7 @@ add_executable(${PROJECT_NAME}
   ./loader/font.c
   ./loader/config.c
   ./loader/vitamenu.c
+  ./loader/sprite_parallel.c
   ./loader/htmltext.c
   ./loader/htmlview.c
   ./loader/androidui.c

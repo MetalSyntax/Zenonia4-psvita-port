@@ -478,6 +478,12 @@ static void PutCompressImg_hook(int p1, int p2, int p3, int p4, unsigned char *p
         sprite_cache_set_pending_dims(p5, p3, p4);
     }
 #endif
+#ifdef ZENONIA_PARALLEL_SPRITES
+    if (op == 0) {
+        extern void sprite_parallel_set_pending(const void *src, int w, int h);
+        sprite_parallel_set_pending(p5, p3, p4); // w/h para partir en franjas (sprite_parallel.c)
+    }
+#endif
     PutCompressImg_orig_trampoline(p1, p2, p3, p4, p5, p6, op, p8, p9);
 }
 

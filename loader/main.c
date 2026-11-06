@@ -553,6 +553,7 @@ int main() {
 		zenonia_install_cgsgraphics_probe(&zenonia4_mod); // ver dynlib.c -- Fase 36, cuenta ~13 primitivas de CGsGraphics:: (INSTRUMENT_CGSGRAPHICS_CALLS)
 		zenonia_install_text_calls_probe(&zenonia4_mod); // ver dynlib.c -- Fase 86, cuenta CGxFACharCache::DrawToFrameBuffer (INSTRUMENT_TEXT_CALLS)
 		zenonia_install_fastclear_optimize(&zenonia4_mod); // ver dynlib.c -- Fase 41, reimplementacion real (no solo conteo) de FastClearNonClipping (FASTCLEAR_NEON_OPTIMIZE)
+		{ extern void zenonia_install_parallel_sprites(so_module *mod); zenonia_install_parallel_sprites(&zenonia4_mod); } // Fase 132, no-op sin PARALLEL_SPRITES
 		zenonia_install_sprite_decode_optimize(&zenonia4_mod); // ver sprite_decode.c -- Fase 43, reemplaza RLE ASM por C nativo
 		zenonia_install_text_native_optimize(&zenonia4_mod); // ver sprite_decode.c -- Fase 87, texto nativo C
 
@@ -675,7 +676,9 @@ int main() {
 				}
 				last_fps_tick = now;
 				// fps = ticks de logica/s (velocidad del juego); shown = frames realmente presentados/s.
-				{ extern volatile int g_engine_fps; game_log("[Pace] target=%d game_speed=%d ticks_fps=%.1f shown_fps=%.1f skip_mode=%d\n", cfg_fps == 30 ? 30 : g_engine_fps, g_engine_fps, fps, shown_fps, g_frameskip_mode); }
+				{ extern volatile int g_engine_fps; extern volatile unsigned int g_par_split_this_frame, g_par_alone_this_frame;
+				  game_log("[Pace] target=%d game_speed=%d ticks_fps=%.1f shown_fps=%.1f skip_mode=%d par_split=%u par_alone=%u\n", cfg_fps == 30 ? 30 : g_engine_fps, g_engine_fps, fps, shown_fps, g_frameskip_mode, g_par_split_this_frame, g_par_alone_this_frame);
+				  g_par_split_this_frame = g_par_alone_this_frame = 0; }
 				g_presented_frames = 0;
 				// Fase 27: promedio de subidas del framebuffer RGB565 por
 				// frame en los ultimos 120 frames -- confirma o descarta si
