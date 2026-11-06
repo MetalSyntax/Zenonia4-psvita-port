@@ -5661,3 +5661,11 @@ achicarlos solo es posible bajando la resolucion del motor, que da zoom (Fase 16
 **Menu START+SELECT:** nueva fila "Frame skip (R+SELECT)" Auto/Off; las filas muestran su
 atajo ("Frame rate (L+SELECT)", "On-screen buttons (R+L)"). `frameskip = 1|0` en config.txt
 (persiste entre sesiones, tambien al usar R+SELECT). ROW_H 30 -> 28 para que entren 14 filas.
+
+### Fase 134 (2026-11-06) - Release v1.2.0: PARALLEL_SPRITES por defecto en --pace / --pace-nologs
+
+PARALLEL_SPRITES=ON en `--pace` y `--pace-nologs` (confirmado en consola, Fase 133).
+`--parallel-test` queda como alias historico. RELEASE_NOTES.md v1.2.0 (v1.1.0 abajo como
+historial). Tag `1.2.0` con `zenonia_4_pace_nologs.vpk` (recomendado) + `zenonia_4_pace.vpk`.
+Pendiente de una sesion larga: audio sin cortes con el worker del nucleo 1, y bateria/
+temperatura con los workers en spin.
